@@ -1,6 +1,9 @@
+"""PandaSet 索引构建的最小单元测试。"""
+
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -11,17 +14,64 @@ from flux4d.datasets.pandaset_clips import (  # noqa: E402
 )
 
 
-def _write_json(path: Path, obj) -> None:
+def _write_json(path: Path, obj: Any) -> None:
+    """写入 JSON 文件。
+
+    Args:
+        path (Path): JSON 文件路径。
+        obj (Any): 可 JSON 序列化的对象。
+
+    Returns:
+        None: 无返回值。
+
+    Raises:
+        TypeError: obj 无法序列化时抛出。
+        OSError: 文件写入失败时抛出。
+
+    实现要点:
+        - 自动创建父目录。
+        - 使用 json.dumps 序列化写入。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj))
 
 
 def _touch(path: Path) -> None:
+    """创建空文件（若不存在）。
+
+    Args:
+        path (Path): 目标文件路径。
+
+    Returns:
+        None: 无返回值。
+
+    Raises:
+        OSError: 文件写入失败时抛出。
+
+    实现要点:
+        - 自动创建父目录。
+        - 写入空字节占位。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"")
 
 
 def test_build_pandaset_clip_index(tmp_path: Path) -> None:
+    """验证索引构建流程与字段一致性。
+
+    Args:
+        tmp_path (Path): pytest 提供的临时目录。
+
+    Returns:
+        None: 无返回值。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+
+    实现要点:
+        - 构造最小化的 PandaSet 目录结构并写入必要文件。
+        - 生成索引后检查 clip 数量与关键字段。
+    """
     data_root = tmp_path / "pandaset"
     scene = data_root / "001"
     lidar_dir = scene / "lidar"

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Generate PandaSet clip index files."""
+"""PandaSet 索引生成入口脚本。"""
 
 from __future__ import annotations
 
 import argparse
 import sys
 from pathlib import Path
+from typing import List, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -13,13 +14,41 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from flux4d.datasets.pandaset_clips import build_pandaset_clip_index  # noqa: E402
 
 
-def _parse_scene_list(text: str):
+def _parse_scene_list(text: str) -> Optional[List[str]]:
+    """解析逗号分隔的场景列表。
+
+    Args:
+        text (str): 逗号分隔的场景字符串。
+
+    Returns:
+        Optional[List[str]]: 解析后的场景列表，空字符串则返回 None。
+
+    Raises:
+        无。
+
+    实现要点:
+        - 去除空白并过滤空项。
+    """
     if not text:
         return None
     return [item.strip() for item in text.split(",") if item.strip()]
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """构建命令行参数解析器。
+
+    Args:
+        无。
+
+    Returns:
+        argparse.ArgumentParser: 参数解析器实例。
+
+    Raises:
+        无。
+
+    实现要点:
+        - 统一定义索引输出路径、FPS、场景划分等参数。
+    """
     parser = argparse.ArgumentParser(description="Build PandaSet clip index PKL files.")
     parser.add_argument(
         "--data-root",
@@ -36,8 +65,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="data/metadata/pandaset_tiny_clips.pkl",
         help="Output PKL for tiny clips.",
     )
-    parser.add_argument("--clip-len-s", type=float, default=1.5, help="Clip length in seconds.")
-    parser.add_argument("--stride-s", type=float, default=1.5, help="Stride in seconds.")
+    parser.add_argument(
+        "--clip-len-s",
+        type=float,
+        default=1.5,
+        help="Clip length in seconds.",
+    )
+    parser.add_argument(
+        "--stride-s",
+        type=float,
+        default=1.5,
+        help="Stride in seconds.",
+    )
     parser.add_argument(
         "--target-fps",
         type=float,
@@ -90,10 +129,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    """脚本入口：生成 full/tiny 索引并输出统计。
+
+    Args:
+        无。
+
+    Returns:
+        int: 进程退出码，0 表示成功。
+
+    Raises:
+        FileNotFoundError: 数据根目录或关键文件缺失。
+        ValueError: 数据不一致或 FPS 偏差过大。
+
+    实现要点:
+        - 将逗号分隔的场景列表解析为列表。
+        - target_fps=0 时退化为使用实际帧率。
+    """
     parser = build_arg_parser()
     args = parser.parse_args()
     tiny_scenes = _parse_scene_list(args.tiny_scenes)
     val_scenes = _parse_scene_list(args.val_scenes)
+    # 约定 target_fps=0 表示使用数据实际 FPS
     target_fps = args.target_fps if args.target_fps > 0 else None
     full_count, tiny_count = build_pandaset_clip_index(
         data_root=args.data_root,
