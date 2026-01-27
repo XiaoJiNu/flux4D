@@ -1,0 +1,22 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Test/cache artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage.xml
+.coverage
+
+# Generated data/index/cache
+data/cache/
+data/metadata/*.pkl
+data/metadata/*.jsonl
+data/metadata/*.npz
+data/metadata/*.npy
+data/metadata/*.pt
