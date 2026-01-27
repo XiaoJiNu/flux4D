@@ -18,16 +18,10 @@ def _parse_scene_list(text: str) -> Optional[List[str]]:
     """解析逗号分隔的场景列表。
 
     Args:
-        text (str): 逗号分隔的场景字符串。
+        text: 逗号分隔的场景字符串。
 
     Returns:
-        Optional[List[str]]: 解析后的场景列表，空字符串则返回 None。
-
-    Raises:
-        无。
-
-    实现要点:
-        - 去除空白并过滤空项。
+        解析后的场景列表，空字符串则返回 None。
     """
     if not text:
         return None
@@ -37,17 +31,11 @@ def _parse_scene_list(text: str) -> Optional[List[str]]:
 def build_arg_parser() -> argparse.ArgumentParser:
     """构建命令行参数解析器。
 
-    Args:
-        无。
-
     Returns:
-        argparse.ArgumentParser: 参数解析器实例。
+        参数解析器实例。
 
-    Raises:
-        无。
-
-    实现要点:
-        - 统一定义索引输出路径、FPS、场景划分等参数。
+    Note:
+        统一定义索引输出路径、FPS、场景划分等参数。
     """
     parser = argparse.ArgumentParser(description="Build PandaSet clip index PKL files.")
     parser.add_argument(
@@ -131,19 +119,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> int:
     """脚本入口：生成 full/tiny 索引并输出统计。
 
-    Args:
-        无。
-
     Returns:
-        int: 进程退出码，0 表示成功。
+        进程退出码，0 表示成功。
 
-    Raises:
-        FileNotFoundError: 数据根目录或关键文件缺失。
-        ValueError: 数据不一致或 FPS 偏差过大。
-
-    实现要点:
-        - 将逗号分隔的场景列表解析为列表。
-        - target_fps=0 时退化为使用实际帧率。
+    Note:
+        target_fps=0 时退化为使用数据实际 FPS。
     """
     parser = build_arg_parser()
     args = parser.parse_args()

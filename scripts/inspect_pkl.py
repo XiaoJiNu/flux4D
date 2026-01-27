@@ -6,23 +6,17 @@ from __future__ import annotations
 import argparse
 import pickle
 from pathlib import Path
-from typing import Any, Dict
+from typing import Dict, List
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     """构建命令行参数解析器。
 
-    Args:
-        无。
-
     Returns:
-        argparse.ArgumentParser: 参数解析器实例。
+        参数解析器实例。
 
-    Raises:
-        无。
-
-    实现要点:
-        - 支持指定 PKL 路径、预览 clip 索引以及断点开关。
+    Note:
+        支持指定 PKL 路径、预览 clip 索引以及断点开关。
     """
     parser = argparse.ArgumentParser(description="Inspect a PKL index payload.")
     parser.add_argument(
@@ -44,38 +38,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _print_summary(payload: Dict[str, Any], clip_index: int) -> None:
+def _print_summary(payload: Dict[str, object], clip_index: int) -> None:
     """打印索引概要与指定 clip 的简要信息。
 
     Args:
-        payload (Dict[str, Any]): PKL 索引字典。
-        clip_index (int): 预览的 clip 索引。
-
-    Returns:
-        None: 无返回值。
+        payload: PKL 索引字典。
+        clip_index: 预览的 clip 索引。
 
     Raises:
-        无。
-
-    实现要点:
-        - 输出 meta 统计，并对 clip_index 做边界裁剪。
+        ValueError: 索引内容格式非法。
     """
-    meta = payload.get("meta", {})
-    clips = payload.get("clips", [])
+    meta = payload.get("meta")
+    clips = payload.get("clips")
+    if not isinstance(meta, dict):
+        raise ValueError("索引缺少 meta 字段")
+    if not isinstance(clips, list):
+        raise ValueError("索引缺少 clips 列表")
+
+    total_clips = meta.get("total_clips", len(clips))
     print("meta keys:", sorted(meta.keys()))
-    print("total clips:", meta.get("total_clips", len(clips)))
+    print("total clips:", total_clips)
     print("data root:", meta.get("data_root"))
     print("clip_len_s:", meta.get("clip_len_s"), "stride_s:", meta.get("stride_s"))
     print("target_fps:", meta.get("target_fps"))
+
     if clips:
         # 保证索引落在有效区间
         clip_index = max(0, min(clip_index, len(clips) - 1))
         clip = clips[clip_index]
-        print("preview clip index:", clip_index)
-        print("clip_id:", clip.get("clip_id"))
-        print("scene_id:", clip.get("scene_id"))
-        print("views:", clip.get("views"))
-        print("num frames:", len(clip.get("frame_ids", [])))
+        if isinstance(clip, dict):
+            print("preview clip index:", clip_index)
+            print("clip_id:", clip.get("clip_id"))
+            print("scene_id:", clip.get("scene_id"))
+            print("views:", clip.get("views"))
+            frame_ids = clip.get("frame_ids")
+            if isinstance(frame_ids, list):
+                print("num frames:", len(frame_ids))
     else:
         print("no clips found")
 
@@ -83,18 +81,12 @@ def _print_summary(payload: Dict[str, Any], clip_index: int) -> None:
 def main() -> int:
     """脚本入口：加载 PKL、输出概要并可进入断点。
 
-    Args:
-        无。
-
     Returns:
-        int: 进程退出码，0 表示成功。
+        进程退出码，0 表示成功。
 
     Raises:
         FileNotFoundError: PKL 文件不存在。
-        pickle.UnpicklingError: 反序列化失败。
-
-    实现要点:
-        - 先输出概要，再根据开关进入断点调试。
+        ValueError: 索引内容格式非法。
     """
     parser = build_arg_parser()
     args = parser.parse_args()
@@ -103,12 +95,16 @@ def main() -> int:
         raise FileNotFoundError(f"PKL not found: {path}")
     with path.open("rb") as fh:
         payload = pickle.load(fh)
+    if not isinstance(payload, dict):
+        raise ValueError("索引内容格式非法")
+
     _print_summary(payload, args.clip_index)
 
     if args.breakpoint:
         print("Entering breakpoint. Use 'payload' and 'clip' variables.")
-        clips = payload.get("clips", [])
-        clip = clips[args.clip_index] if clips else None
+        clips = payload.get("clips")
+        clip_list: List[object] = clips if isinstance(clips, list) else []
+        clip = clip_list[args.clip_index] if clip_list else None
         breakpoint()  # noqa: T100
     return 0
 

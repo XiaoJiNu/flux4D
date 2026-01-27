@@ -20,3 +20,6 @@ data/metadata/*.jsonl
 data/metadata/*.npz
 data/metadata/*.npy
 data/metadata/*.pt
+
+# Generated visualizations
+assets/vis/

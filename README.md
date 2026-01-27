@@ -40,6 +40,18 @@ Makefile shortcut:
 make pandaset-index
 ```
 
+### Stage 2: Lift alignment sanity check
+
+Visualize LiDAR projection alignment for a single clip/frame:
+
+```bash
+python tools/vis/vis_lift_alignment.py \
+  --index-path data/metadata/pandaset_tiny_clips.pkl \
+  --clip-index 0 --frame-index 0 --camera front_camera
+```
+
+Outputs default to `assets/vis/lift_alignment/` (ignored by git).
+
 ## Development notes
 
 - Keep reproducible commands in this file when new scripts are added.
