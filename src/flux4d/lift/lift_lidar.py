@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import gzip
-import pickle
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -68,14 +66,20 @@ class GaussianSet:
     velocities: np.ndarray
 
 
-def load_lidar_frame(path: str) -> Tuple[np.ndarray, np.ndarray]:
+def load_lidar_frame(path: str, sensor_id: int = -1) -> Tuple[np.ndarray, np.ndarray]:
     """读取 LiDAR 帧并返回点坐标与强度。
 
     Args:
         path: LiDAR 帧文件路径（.pkl.gz）。
+        sensor_id: 传感器 ID。PandaSet 默认包含两套 LiDAR：`0`（机械 360°）与 `1`（前向）。
+            设为 `-1` 表示返回全部点（默认），设为 `0/1` 表示仅返回对应 `d` 字段的点。
 
     Returns:
         点坐标数组与强度数组。
+
+        PandaSet 的点云默认存储在世界坐标系（world）下，可参考 pandaset-devkit：
+        - `pandaset.sensors.Lidar.data` 的说明：静态物体跨帧坐标保持不变。
+        因此在做相机投影时，通常直接使用 world->camera 的外参变换即可。
 
     Raises:
         ModuleNotFoundError: pandas 未安装。
@@ -91,14 +95,15 @@ def load_lidar_frame(path: str) -> Tuple[np.ndarray, np.ndarray]:
     if not path_obj.exists():
         raise FileNotFoundError(f"LiDAR 文件不存在: {path_obj}")
 
-    with gzip.open(path_obj, "rb") as fh:
-        frame = pickle.load(fh)
-
+    frame = pd.read_pickle(str(path_obj))
     if not isinstance(frame, pd.DataFrame):
         raise ValueError("LiDAR 文件内容不是 pandas.DataFrame")
     for key in ("x", "y", "z"):
         if key not in frame.columns:
             raise ValueError(f"LiDAR 缺少字段: {key}")
+
+    if sensor_id in (0, 1) and "d" in frame.columns:
+        frame = frame.loc[frame["d"] == sensor_id]
 
     points = frame[["x", "y", "z"]].to_numpy(dtype=np.float32)
     if "i" in frame.columns:
@@ -130,7 +135,10 @@ def load_image_rgb(path: str) -> np.ndarray:
     if not path_obj.exists():
         raise FileNotFoundError(f"图像文件不存在: {path_obj}")
 
-    image = Image.open(path_obj).convert("RGB")
+    # 参考 pandaset-devkit 的实现：复制后关闭文件句柄，避免 Pillow 懒加载导致句柄泄漏。
+    image_file = Image.open(path_obj).convert("RGB")
+    image = image_file.copy()
+    image_file.close()
     array = np.asarray(image, dtype=np.float32)
     return array / 255.0
 
@@ -223,7 +231,10 @@ def transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
 
 
 def transform_lidar_to_camera(
-    points_lidar: np.ndarray, lidar_pose: Pose, camera_pose: Pose
+    points_lidar: np.ndarray,
+    lidar_pose: Pose,
+    camera_pose: Pose,
+    points_in_world: bool = True,
 ) -> np.ndarray:
     """将 LiDAR 点从 LiDAR 坐标系转换到相机坐标系。
 
@@ -231,18 +242,42 @@ def transform_lidar_to_camera(
         points_lidar: LiDAR 点坐标，形状为 (N, 3)。
         lidar_pose: LiDAR 位姿。
         camera_pose: 相机位姿。
+        points_in_world: 输入点是否已在世界坐标系下。PandaSet 原始点云默认在世界坐标系中，
+            此时应设为 True（默认）。若你已经将点转换到 LiDAR/ego 坐标系，则设为 False。
 
     Returns:
         相机坐标系下的点坐标。
 
     Note:
-        使用 lidar->world 和 world->camera 的组合变换。
+        - PandaSet 原始点云通常已在世界坐标系中（参考 pandaset-devkit），因此默认只做
+          world->camera 的变换。
+        - 当 points_in_world=False 时，使用 lidar->world 和 world->camera 的组合变换。
     """
-    lidar_to_world = pose_to_matrix(lidar_pose)
     camera_to_world = pose_to_matrix(camera_pose)
     world_to_camera = np.linalg.inv(camera_to_world)
+    if points_in_world:
+        return transform_points(points_lidar, world_to_camera)
+    lidar_to_world = pose_to_matrix(lidar_pose)
     points_world = transform_points(points_lidar, lidar_to_world)
     return transform_points(points_world, world_to_camera)
+
+
+def transform_world_to_ego(points_world: np.ndarray, ego_pose: Pose) -> np.ndarray:
+    """将世界坐标系点转换到 ego/LiDAR 坐标系。
+
+    Args:
+        points_world: 世界坐标系点坐标，形状为 (N, 3)。
+        ego_pose: ego/LiDAR 在世界坐标系下的位姿（sensor->world）。
+
+    Returns:
+        ego/LiDAR 坐标系下的点坐标。
+
+    Note:
+        参考 pandaset-devkit `geometry.lidar_points_to_ego`：使用 `world->ego = inv(ego->world)`。
+    """
+    ego_to_world = pose_to_matrix(ego_pose)
+    world_to_ego = np.linalg.inv(ego_to_world)
+    return transform_points(points_world, world_to_ego)
 
 
 def voxel_downsample_points(points: np.ndarray, voxel_size: float) -> np.ndarray:
@@ -301,7 +336,7 @@ def compute_knn_mean_distance(
 
     Raises:
         ValueError: k 非法或点云为空。
-        ModuleNotFoundError: 点数过大且缺少 scipy。
+        ModuleNotFoundError: 点数过大且 scipy 不可用（未安装或二进制不兼容）。
 
     Note:
         优先使用 scipy 的 KDTree，加速大规模点云计算。
@@ -324,9 +359,9 @@ def compute_knn_mean_distance(
         distances, _ = tree.query(points, k=k + 1)
         mean_dist = distances[:, 1:].mean(axis=1)
         return mean_dist.astype(np.float32)
-    except ModuleNotFoundError as exc:
+    except (ModuleNotFoundError, ImportError, ValueError) as exc:
         if num_points > max_bruteforce_points:
-            raise ModuleNotFoundError("缺少 scipy，且点数过大无法暴力计算") from exc
+            raise ModuleNotFoundError("scipy 不可用，且点数过大无法暴力计算") from exc
 
     # 点数较小时使用暴力计算，避免额外依赖
     diffs = points[:, None, :] - points[None, :, :]
@@ -370,21 +405,13 @@ def project_points_to_camera(
 
     u = x / z * fx + cx
     v = y / z * fy + cy
-    mask = (
-        valid_depth
-        & (u >= 0)
-        & (u < float(width))
-        & (v >= 0)
-        & (v < float(height))
-    )
+    mask = valid_depth & (u >= 0) & (u < float(width)) & (v >= 0) & (v < float(height))
 
     uv = np.stack([u, v], axis=1)
     return uv.astype(np.float32), z.astype(np.float32), mask
 
 
-def sample_colors_from_image(
-    image: np.ndarray, uv: np.ndarray, mask: np.ndarray
-) -> np.ndarray:
+def sample_colors_from_image(image: np.ndarray, uv: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """根据像素坐标采样颜色。
 
     Args:
@@ -562,9 +589,7 @@ def colorize_points_multi_view(
     for view in camera_views:
         points_camera = transform_lidar_to_camera(points_lidar, lidar_pose, view.pose)
         height, width = view.image.shape[:2]
-        uv, _, mask = project_points_to_camera(
-            points_camera, view.intrinsics, (width, height)
-        )
+        uv, _, mask = project_points_to_camera(points_camera, view.intrinsics, (width, height))
         valid = mask & remaining
         if not np.any(valid):
             continue
@@ -593,7 +618,8 @@ def build_initial_gaussians_for_frame(
         points_lidar: LiDAR 点坐标，形状为 (N, 3)。
         lidar_pose: LiDAR 位姿。
         camera_views: 相机视图列表。
-        frame_timestamp: 帧时间戳。
+        frame_timestamp: 帧时间戳（秒）。建议使用相对时间（例如以 clip 起始 LiDAR 时间为 0），
+            避免直接使用 epoch 秒导致 float32 精度不足。
         voxel_size: 体素下采样尺寸。
         knn_k: kNN 近邻数量。
         default_color: 未命中视角时的默认颜色。
@@ -607,9 +633,7 @@ def build_initial_gaussians_for_frame(
     scales = np.repeat(scales_scalar[:, None], 3, axis=1)
 
     if camera_views:
-        colors = colorize_points_multi_view(
-            downsampled, lidar_pose, camera_views, default_color
-        )
+        colors = colorize_points_multi_view(downsampled, lidar_pose, camera_views, default_color)
     else:
         colors = np.tile(np.array(default_color, dtype=np.float32), (downsampled.shape[0], 1))
 
@@ -668,13 +692,17 @@ def build_initial_gaussians_for_clip(
         frame_list = list(frame_indices)
 
     gaussians: List[GaussianSet] = []
+    base_timestamp: Optional[float] = None
     for frame_index in frame_list:
         if frame_index >= total_frames:
             raise ValueError("frame_index 超出范围")
         lidar_path = Path(data_root) / lidar_paths[frame_index]
         points_lidar, _ = load_lidar_frame(str(lidar_path))
         lidar_pose = get_lidar_pose(clip, frame_index)
-        frame_timestamp = get_lidar_timestamp(clip, frame_index)
+        frame_timestamp_abs = get_lidar_timestamp(clip, frame_index)
+        if base_timestamp is None:
+            base_timestamp = frame_timestamp_abs
+        frame_timestamp = frame_timestamp_abs - base_timestamp
         camera_views = build_camera_views(clip, frame_index, data_root, view_names)
         gaussians.append(
             build_initial_gaussians_for_frame(

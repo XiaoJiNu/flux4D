@@ -273,6 +273,8 @@ def _build_scene_clips(
         _ensure_len(f"{cam_name} timestamps", cam_ts, len(cam_files), strict)
         _ensure_len(f"{cam_name} poses", cam_poses, len(cam_files), strict)
         _ensure_len(f"{cam_name} frame count", cam_files, len(lidar_files), strict)
+        if not isinstance(cam_ts, list):
+            raise ValueError(f"{cam_name} timestamps 格式非法")
         cameras[cam_name] = {
             "timestamps": cam_ts,
             "intrinsics": cam_intr,
