@@ -39,6 +39,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(description="Build PandaSet clip index PKL files.")
     parser.add_argument(
+        "--preset",
+        choices=("paper", "debug"),
+        default="paper",
+        help="Index preset: paper (align to paper/supp) or debug (legacy seconds-based slicing).",
+    )
+    parser.add_argument(
         "--data-root",
         default="/home/yr/yr/data/automonous/pandaset",
         help="Path to PandaSet root.",
@@ -72,6 +78,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Target FPS used for clip slicing (set to 0 to use inferred).",
     )
     parser.add_argument(
+        "--camera-names",
+        type=str,
+        default="",
+        help="Comma-separated camera names to keep (paper preset defaults to front_camera).",
+    )
+    parser.add_argument(
         "--tiny-scenes",
         type=str,
         default="",
@@ -87,13 +99,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--val-scenes",
         type=str,
         default="",
-        help="Comma-separated scene ids for validation split.",
+        help="Comma-separated scene ids for test split (paper preset has a fixed default).",
     )
     parser.add_argument(
         "--val-num-scenes",
         type=int,
         default=10,
-        help="Number of validation scenes when --val-scenes is empty.",
+        help="Number of test scenes when --val-scenes is empty (debug preset only).",
     )
     parser.add_argument(
         "--max-scenes",
@@ -129,12 +141,14 @@ def main() -> int:
     args = parser.parse_args()
     tiny_scenes = _parse_scene_list(args.tiny_scenes)
     val_scenes = _parse_scene_list(args.val_scenes)
+    camera_names = _parse_scene_list(args.camera_names)
     # 约定 target_fps=0 表示使用数据实际 FPS
     target_fps = args.target_fps if args.target_fps > 0 else None
     full_count, tiny_count = build_pandaset_clip_index(
         data_root=args.data_root,
         out_pkl_full=args.out_full,
         out_pkl_tiny=args.out_tiny,
+        preset=args.preset,
         clip_len_s=args.clip_len_s,
         stride_s=args.stride_s,
         target_fps=target_fps,
@@ -142,6 +156,7 @@ def main() -> int:
         tiny_num_scenes=args.tiny_num_scenes,
         val_scenes=val_scenes,
         val_num_scenes=args.val_num_scenes,
+        camera_names=camera_names,
         max_scenes=args.max_scenes,
         strict=args.strict,
     )

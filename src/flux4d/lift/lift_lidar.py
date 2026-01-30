@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from typing import TypedDict
@@ -66,6 +67,247 @@ class GaussianSet:
     velocities: np.ndarray
 
 
+def normalize_timestamps_to_unit_range(timestamps: Sequence[float]) -> np.ndarray:
+    """将时间戳序列按 min-max 归一化到 [0, 1]。
+
+    Args:
+        timestamps: 时间戳序列（秒）。
+
+    Returns:
+        归一化后的时间戳数组，dtype=float32，范围为 [0,1]。
+
+    Note:
+        对应补充材料 A.2：每个 Gaussian 继承 LiDAR timestamp，并归一化到 [0,1]。
+    """
+    if not timestamps:
+        return np.zeros((0,), dtype=np.float32)
+    ts = np.asarray(timestamps, dtype=np.float64)
+    ts_min = float(ts.min())
+    ts_max = float(ts.max())
+    if ts_max <= ts_min:
+        return np.zeros((ts.shape[0],), dtype=np.float32)
+    normalized = (ts - ts_min) / (ts_max - ts_min)
+    return normalized.astype(np.float32)
+
+
+def _safe_logit(values: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """将 [0,1] 范围内的值转为 logit 参数空间。
+
+    Args:
+        values: 输入数组，期望范围为 [0,1]。
+        eps: 数值稳定用的截断阈值，避免 log(0)。
+
+    Returns:
+        logit(values) 的数组，dtype=float32。
+
+    Note:
+        补充材料 A.2 提到在渲染前对 color/opacity 应用 sigmoid；因此训练中常用将其
+        以 logit 形式存储并在渲染前激活。
+    """
+    clipped = np.clip(values, eps, 1.0 - eps).astype(np.float32)
+    return (np.log(clipped) - np.log(1.0 - clipped)).astype(np.float32)
+
+
+def _random_unit_quaternions(count: int, rng: np.random.Generator) -> np.ndarray:
+    """采样随机单位四元数（w,x,y,z）。
+
+    Args:
+        count: 需要采样的数量。
+        rng: NumPy 随机数生成器。
+
+    Returns:
+        形状为 (count, 4) 的四元数数组，dtype=float32。
+
+    Note:
+        使用经典的 uniform SO(3) 采样方法，见 Shoemake (1992)。
+    """
+    if count <= 0:
+        return np.zeros((0, 4), dtype=np.float32)
+    u1 = rng.random(count, dtype=np.float32)
+    u2 = rng.random(count, dtype=np.float32)
+    u3 = rng.random(count, dtype=np.float32)
+    sqrt1_u1 = np.sqrt(1.0 - u1)
+    sqrt_u1 = np.sqrt(u1)
+    two_pi = np.float32(2.0 * math.pi)
+    qx = sqrt1_u1 * np.sin(two_pi * u2)
+    qy = sqrt1_u1 * np.cos(two_pi * u2)
+    qz = sqrt_u1 * np.sin(two_pi * u3)
+    qw = sqrt_u1 * np.cos(two_pi * u3)
+    return np.stack([qw, qx, qy, qz], axis=1).astype(np.float32)
+
+
+def _compute_scale_params_from_knn(distances: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """将 kNN 平均距离转换为 scale 参数（log 空间）。
+
+    Args:
+        distances: kNN 平均距离（正数），形状为 (N,)。
+        eps: 数值稳定用的下界。
+
+    Returns:
+        scale 参数数组，形状为 (N,)。
+
+    Note:
+        补充材料 A.2：对 scale 应用对数变换以稳定训练。
+    """
+    safe = np.maximum(distances.astype(np.float32), np.float32(eps))
+    return np.log(safe).astype(np.float32)
+
+
+def concat_gaussian_sets(gaussians: Sequence[GaussianSet]) -> GaussianSet:
+    """按字段拼接多个 GaussianSet。
+
+    Args:
+        gaussians: 多个高斯集合。
+
+    Returns:
+        拼接后的高斯集合。
+
+    Raises:
+        ValueError: 输入为空或字段形状不一致。
+    """
+    if not gaussians:
+        raise ValueError("gaussians 不能为空")
+    return GaussianSet(
+        positions=np.concatenate([item.positions for item in gaussians], axis=0),
+        scales=np.concatenate([item.scales for item in gaussians], axis=0),
+        rotations=np.concatenate([item.rotations for item in gaussians], axis=0),
+        colors=np.concatenate([item.colors for item in gaussians], axis=0),
+        opacities=np.concatenate([item.opacities for item in gaussians], axis=0),
+        timestamps=np.concatenate([item.timestamps for item in gaussians], axis=0),
+        velocities=np.concatenate([item.velocities for item in gaussians], axis=0),
+    )
+
+
+def downsample_gaussians(gaussians: GaussianSet, max_gaussians: int, rng: np.random.Generator) -> GaussianSet:
+    """对高斯集合做随机下采样以控制数量上限。
+
+    Args:
+        gaussians: 输入高斯集合。
+        max_gaussians: 最大保留数量，必须为正整数。
+        rng: 随机数生成器。
+
+    Returns:
+        下采样后的高斯集合。
+
+    Raises:
+        ValueError: max_gaussians 非法。
+    """
+    if max_gaussians <= 0:
+        raise ValueError("max_gaussians 必须为正整数")
+    num = int(gaussians.positions.shape[0])
+    if num <= max_gaussians:
+        return gaussians
+    indices = rng.choice(num, size=max_gaussians, replace=False)
+    return GaussianSet(
+        positions=gaussians.positions[indices],
+        scales=gaussians.scales[indices],
+        rotations=gaussians.rotations[indices],
+        colors=gaussians.colors[indices],
+        opacities=gaussians.opacities[indices],
+        timestamps=gaussians.timestamps[indices],
+        velocities=gaussians.velocities[indices],
+    )
+
+
+def _aabb_center_and_length(points: np.ndarray) -> Tuple[np.ndarray, float]:
+    """计算点集 AABB 的中心与对角线长度。
+
+    Args:
+        points: 点坐标数组，形状为 (N, 3)。
+
+    Returns:
+        (center, length) 元组。
+    """
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points 形状必须为 (N, 3)")
+    mins = points.min(axis=0)
+    maxs = points.max(axis=0)
+    center = (mins + maxs) * 0.5
+    length = float(np.linalg.norm(maxs - mins))
+    return center.astype(np.float32), length
+
+
+def _sample_upper_hemisphere_surface(
+    center: np.ndarray,
+    radius: float,
+    num_points: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """在上半球面（z>=0）均匀采样点。
+
+    Args:
+        center: 球心，形状为 (3,)。
+        radius: 半径。
+        num_points: 采样数量。
+        rng: 随机数生成器。
+
+    Returns:
+        采样点坐标数组，形状为 (num_points, 3)。
+    """
+    if num_points <= 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    u = rng.random(num_points, dtype=np.float32)
+    v = rng.random(num_points, dtype=np.float32)
+    phi = np.float32(2.0 * math.pi) * v
+    cos_theta = u  # hemisphere: cos(theta) in [0,1]
+    sin_theta = np.sqrt(np.maximum(1.0 - cos_theta * cos_theta, 0.0))
+    x = sin_theta * np.cos(phi)
+    y = sin_theta * np.sin(phi)
+    z = cos_theta
+    dirs = np.stack([x, y, z], axis=1).astype(np.float32)
+    return center[None, :] + np.float32(radius) * dirs
+
+
+def add_sky_points(
+    gaussians: GaussianSet,
+    num_sky_points: int,
+    rng: np.random.Generator,
+    sky_scale_param: float = 0.0,
+    sky_color: Tuple[float, float, float] = (0.5, 0.5, 0.5),
+    sky_opacity: float = 0.5,
+) -> GaussianSet:
+    """按补充材料 A.2 添加 sky 点到高斯集合。
+
+    Args:
+        gaussians: 基础高斯集合。
+        num_sky_points: sky 点数量（补充材料默认 1,000,000）。
+        rng: 随机数生成器。
+        sky_scale_param: sky 点的 scale 参数初值（log 空间）。
+        sky_color: sky 点颜色（0~1，内部会转为 logit 参数）。
+        sky_opacity: sky 点不透明度（0~1，内部会转为 logit 参数）。
+
+    Returns:
+        加入 sky 点后的高斯集合。
+
+    Note:
+        - 先对现有高斯计算 AABB。
+        - 以 AABB 中心为球心，半径为 `4 * AABB_length` 的上半球面采样点。
+    """
+    if num_sky_points <= 0:
+        return gaussians
+    center, aabb_length = _aabb_center_and_length(gaussians.positions)
+    radius = 4.0 * aabb_length
+    if radius <= 0:
+        return gaussians
+    positions = _sample_upper_hemisphere_surface(center, radius, num_sky_points, rng)
+    scales = np.full((num_sky_points, 3), sky_scale_param, dtype=np.float32)
+    rotations = _random_unit_quaternions(num_sky_points, rng)
+    colors = _safe_logit(np.tile(np.array(sky_color, dtype=np.float32), (num_sky_points, 1)))
+    opacities = np.full((num_sky_points,), _safe_logit(np.array([sky_opacity], dtype=np.float32))[0], dtype=np.float32)
+    timestamps = np.zeros((num_sky_points,), dtype=np.float32)
+    velocities = np.zeros((num_sky_points, 3), dtype=np.float32)
+    extra = GaussianSet(
+        positions=positions.astype(np.float32),
+        scales=scales,
+        rotations=rotations,
+        colors=colors,
+        opacities=opacities,
+        timestamps=timestamps,
+        velocities=velocities,
+    )
+    return concat_gaussian_sets([gaussians, extra])
+
+
 def load_lidar_frame(path: str, sensor_id: int = -1) -> Tuple[np.ndarray, np.ndarray]:
     """读取 LiDAR 帧并返回点坐标与强度。
 
@@ -82,14 +324,17 @@ def load_lidar_frame(path: str, sensor_id: int = -1) -> Tuple[np.ndarray, np.nda
         因此在做相机投影时，通常直接使用 world->camera 的外参变换即可。
 
     Raises:
-        ModuleNotFoundError: pandas 未安装。
+        RuntimeError: pandas 不可用（未安装或与当前 NumPy ABI 不兼容）。
         FileNotFoundError: LiDAR 文件不存在。
         ValueError: 文件内容格式非法或缺失必要字段。
     """
     try:
         import pandas as pd
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError("缺少 pandas，请先安装依赖") from exc
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        raise RuntimeError(
+            "pandas 不可用：请在可用的 Python 环境中运行（例如 conda 环境 gaussianstorm），"
+            "或安装与 NumPy 版本兼容的 pandas。"
+        ) from exc
 
     path_obj = Path(path)
     if not path_obj.exists():
@@ -608,9 +853,10 @@ def build_initial_gaussians_for_frame(
     camera_views: Sequence[CameraView],
     frame_timestamp: float,
     voxel_size: float = 0.2,
-    knn_k: int = 8,
+    knn_k: int = 3,
     default_color: Tuple[float, float, float] = (0.5, 0.5, 0.5),
-    opacity: float = 0.5,
+    opacity_init: float = 0.5,
+    rng: Optional[np.random.Generator] = None,
 ) -> GaussianSet:
     """基于单帧 LiDAR 构建初始高斯集合。
 
@@ -618,27 +864,40 @@ def build_initial_gaussians_for_frame(
         points_lidar: LiDAR 点坐标，形状为 (N, 3)。
         lidar_pose: LiDAR 位姿。
         camera_views: 相机视图列表。
-        frame_timestamp: 帧时间戳（秒）。建议使用相对时间（例如以 clip 起始 LiDAR 时间为 0），
-            避免直接使用 epoch 秒导致 float32 精度不足。
+        frame_timestamp: 帧时间戳（归一化到 [0,1]），以 LiDAR 为时间轴。
         voxel_size: 体素下采样尺寸。
         knn_k: kNN 近邻数量。
         default_color: 未命中视角时的默认颜色。
-        opacity: 初始不透明度。
+        opacity_init: 初始不透明度（0~1）。
+        rng: 可选随机数生成器，用于四元数初始化。
 
     Returns:
         初始高斯集合。
+
+    Note:
+        - Scale：按补充材料 A.2 使用 3-NN 平均距离，并在此处存储其 log 参数（后续渲染前用
+          softplus 激活）。
+        - Color/Opacity：按补充材料 A.2 在渲染前会经过 sigmoid，因此在此处存储为 logit 参数。
     """
+    if rng is None:
+        rng = np.random.default_rng()
     downsampled = voxel_downsample_points(points_lidar, voxel_size)
     scales_scalar = compute_knn_mean_distance(downsampled, knn_k)
-    scales = np.repeat(scales_scalar[:, None], 3, axis=1)
+    scales_param = _compute_scale_params_from_knn(scales_scalar)
+    scales = np.repeat(scales_param[:, None], 3, axis=1)
 
     if camera_views:
         colors = colorize_points_multi_view(downsampled, lidar_pose, camera_views, default_color)
     else:
         colors = np.tile(np.array(default_color, dtype=np.float32), (downsampled.shape[0], 1))
 
-    rotations = np.tile(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32), (downsampled.shape[0], 1))
-    opacities = np.full((downsampled.shape[0],), opacity, dtype=np.float32)
+    rotations = _random_unit_quaternions(downsampled.shape[0], rng)
+    colors_param = _safe_logit(colors)
+    opacities = np.full(
+        (downsampled.shape[0],),
+        _safe_logit(np.array([opacity_init], dtype=np.float32))[0],
+        dtype=np.float32,
+    )
     timestamps = np.full((downsampled.shape[0],), frame_timestamp, dtype=np.float32)
     velocities = np.zeros((downsampled.shape[0], 3), dtype=np.float32)
 
@@ -646,7 +905,7 @@ def build_initial_gaussians_for_frame(
         positions=downsampled,
         scales=scales,
         rotations=rotations,
-        colors=colors,
+        colors=colors_param,
         opacities=opacities,
         timestamps=timestamps,
         velocities=velocities,
@@ -659,9 +918,10 @@ def build_initial_gaussians_for_clip(
     frame_indices: Optional[Sequence[int]] = None,
     view_names: Optional[Sequence[str]] = None,
     voxel_size: float = 0.2,
-    knn_k: int = 8,
+    knn_k: int = 3,
     default_color: Tuple[float, float, float] = (0.5, 0.5, 0.5),
-    opacity: float = 0.5,
+    opacity_init: float = 0.5,
+    random_seed: int = 0,
 ) -> List[GaussianSet]:
     """为 clip 内多个帧构建初始高斯集合。
 
@@ -673,7 +933,8 @@ def build_initial_gaussians_for_clip(
         voxel_size: 体素下采样尺寸。
         knn_k: kNN 近邻数量。
         default_color: 未命中视角时的默认颜色。
-        opacity: 初始不透明度。
+        opacity_init: 初始不透明度（0~1）。
+        random_seed: 随机种子（用于四元数初始化）。
 
     Returns:
         初始高斯集合列表。
@@ -692,17 +953,19 @@ def build_initial_gaussians_for_clip(
         frame_list = list(frame_indices)
 
     gaussians: List[GaussianSet] = []
-    base_timestamp: Optional[float] = None
+    abs_timestamps: List[float] = []
     for frame_index in frame_list:
+        abs_timestamps.append(get_lidar_timestamp(clip, frame_index))
+    norm_timestamps = normalize_timestamps_to_unit_range(abs_timestamps)
+
+    rng = np.random.default_rng(random_seed)
+    for list_index, frame_index in enumerate(frame_list):
         if frame_index >= total_frames:
             raise ValueError("frame_index 超出范围")
         lidar_path = Path(data_root) / lidar_paths[frame_index]
         points_lidar, _ = load_lidar_frame(str(lidar_path))
         lidar_pose = get_lidar_pose(clip, frame_index)
-        frame_timestamp_abs = get_lidar_timestamp(clip, frame_index)
-        if base_timestamp is None:
-            base_timestamp = frame_timestamp_abs
-        frame_timestamp = frame_timestamp_abs - base_timestamp
+        frame_timestamp = float(norm_timestamps[list_index])
         camera_views = build_camera_views(clip, frame_index, data_root, view_names)
         gaussians.append(
             build_initial_gaussians_for_frame(
@@ -713,7 +976,62 @@ def build_initial_gaussians_for_clip(
                 voxel_size=voxel_size,
                 knn_k=knn_k,
                 default_color=default_color,
-                opacity=opacity,
+                opacity_init=opacity_init,
+                rng=rng,
             )
         )
     return gaussians
+
+
+def build_initial_gaussians_for_clip_aggregated(
+    clip: Dict[str, object],
+    data_root: str,
+    frame_indices: Optional[Sequence[int]] = None,
+    view_names: Optional[Sequence[str]] = None,
+    voxel_size: float = 0.2,
+    knn_k: int = 3,
+    default_color: Tuple[float, float, float] = (0.5, 0.5, 0.5),
+    opacity_init: float = 0.5,
+    random_seed: int = 0,
+    num_sky_points: int = 1_000_000,
+    max_gaussians: Optional[int] = None,
+) -> GaussianSet:
+    """构建 clip 的聚合初始高斯集合（G_init），并按补充材料添加 sky 点。
+
+    Args:
+        clip: clip 元信息条目。
+        data_root: PandaSet 根目录。
+        frame_indices: 需要处理的帧索引列表，None 表示全帧。
+        view_names: 指定的相机名称列表，None 表示使用 clip 内视角。
+        voxel_size: 体素下采样尺寸。
+        knn_k: kNN 近邻数量（补充材料默认 3）。
+        default_color: 未命中视角时的默认颜色。
+        opacity_init: 初始不透明度（0~1）。
+        random_seed: 随机种子（用于四元数与 sky 采样）。
+        num_sky_points: sky 点数量（补充材料默认 1,000,000；调试可设为更小）。
+        max_gaussians: 可选的高斯数量上限。若指定且最终高斯数量超过该值，则随机下采样到该上限。
+
+    Returns:
+        聚合后的初始高斯集合。
+
+    Note:
+        - 先对 clip 内帧分别 Lift，再拼接得到 G_init。
+        - 再基于 G_init 的 AABB 采样 sky 点并拼接。
+    """
+    per_frame = build_initial_gaussians_for_clip(
+        clip=clip,
+        data_root=data_root,
+        frame_indices=frame_indices,
+        view_names=view_names,
+        voxel_size=voxel_size,
+        knn_k=knn_k,
+        default_color=default_color,
+        opacity_init=opacity_init,
+        random_seed=random_seed,
+    )
+    merged = concat_gaussian_sets(per_frame)
+    sky_rng = np.random.default_rng(random_seed + 1)
+    merged = add_sky_points(merged, num_sky_points=num_sky_points, rng=sky_rng)
+    if max_gaussians is not None:
+        merged = downsample_gaussians(merged, max_gaussians=int(max_gaussians), rng=sky_rng)
+    return merged

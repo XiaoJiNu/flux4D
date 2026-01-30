@@ -59,7 +59,28 @@ def _print_summary(payload: Dict[str, object], clip_index: int) -> None:
     print("meta keys:", sorted(meta.keys()))
     print("total clips:", total_clips)
     print("data root:", meta.get("data_root"))
-    print("clip_len_s:", meta.get("clip_len_s"), "stride_s:", meta.get("stride_s"))
+    if "settings" in meta:
+        print("preset:", meta.get("preset"))
+        print("camera_names:", meta.get("camera_names"))
+        print("test_scenes:", meta.get("test_scenes"))
+        settings = meta.get("settings")
+        if isinstance(settings, list):
+            print("settings:")
+            for setting in settings:
+                if not isinstance(setting, dict):
+                    continue
+                print(
+                    "  -",
+                    setting.get("name"),
+                    "len_frames=",
+                    setting.get("clip_len_frames"),
+                    "stride_frames=",
+                    setting.get("stride_frames"),
+                    "max_clips_per_scene=",
+                    setting.get("max_clips_per_scene"),
+                )
+    else:
+        print("clip_len_s:", meta.get("clip_len_s"), "stride_s:", meta.get("stride_s"))
     print("target_fps:", meta.get("target_fps"))
 
     if clips:
@@ -70,6 +91,7 @@ def _print_summary(payload: Dict[str, object], clip_index: int) -> None:
             print("preview clip index:", clip_index)
             print("clip_id:", clip.get("clip_id"))
             print("scene_id:", clip.get("scene_id"))
+            print("setting:", clip.get("setting"), "split:", clip.get("split"))
             print("views:", clip.get("views"))
             frame_ids = clip.get("frame_ids")
             if isinstance(frame_ids, list):

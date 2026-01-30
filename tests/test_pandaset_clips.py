@@ -44,11 +44,7 @@ def test_build_pandaset_clip_index(tmp_path: Path) -> None:
         构造最小化 PandaSet 目录结构并检查关键字段。
     """
     data_root = tmp_path / "pandaset"
-    scene = data_root / "001"
-    lidar_dir = scene / "lidar"
-    camera_dir = scene / "camera" / "front_camera"
-
-    num_frames = 31
+    num_frames = 80
     timestamps = [1557539924.5 + i * 0.1 for i in range(num_frames)]
     poses = [
         {
@@ -58,19 +54,23 @@ def test_build_pandaset_clip_index(tmp_path: Path) -> None:
         for _ in range(num_frames)
     ]
 
-    _write_json(lidar_dir / "timestamps.json", timestamps)
-    _write_json(lidar_dir / "poses.json", poses)
-    for i in range(num_frames):
-        _touch(lidar_dir / f"{i:02d}.pkl.gz")
+    for scene_id in ("001", "002"):
+        scene = data_root / scene_id
+        lidar_dir = scene / "lidar"
+        camera_dir = scene / "camera" / "front_camera"
+        _write_json(lidar_dir / "timestamps.json", timestamps)
+        _write_json(lidar_dir / "poses.json", poses)
+        for i in range(num_frames):
+            _touch(lidar_dir / f"{i:02d}.pkl.gz")
 
-    _write_json(camera_dir / "timestamps.json", timestamps)
-    _write_json(camera_dir / "poses.json", poses)
-    _write_json(
-        camera_dir / "intrinsics.json",
-        {"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0},
-    )
-    for i in range(num_frames):
-        _touch(camera_dir / f"{i:02d}.jpg")
+        _write_json(camera_dir / "timestamps.json", timestamps)
+        _write_json(camera_dir / "poses.json", poses)
+        _write_json(
+            camera_dir / "intrinsics.json",
+            {"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0},
+        )
+        for i in range(num_frames):
+            _touch(camera_dir / f"{i:02d}.jpg")
 
     out_full = tmp_path / "full.pkl"
     out_tiny = tmp_path / "tiny.pkl"
@@ -78,22 +78,38 @@ def test_build_pandaset_clip_index(tmp_path: Path) -> None:
         data_root=str(data_root),
         out_pkl_full=str(out_full),
         out_pkl_tiny=str(out_tiny),
-        clip_len_s=1.5,
-        stride_s=1.5,
+        preset="paper",
         target_fps=10.0,
-        tiny_scenes=["001"],
-        val_scenes=["001"],
+        tiny_scenes=["001", "002"],
     )
 
-    assert full_count == 2
-    assert tiny_count == 2
+    assert full_count == 22
+    assert tiny_count == 22
 
     payload = load_clip_index(str(out_full))
-    assert payload["meta"]["total_clips"] == 2
+    assert payload["meta"]["total_clips"] == 22
+    assert payload["meta"]["preset"] == "paper"
 
-    clip = payload["clips"][0]
+    clips = payload["clips"]
+    assert isinstance(clips, list)
+
+    train_interp = [
+        clip for clip in clips if clip.get("scene_id") == "002" and clip.get("setting") == "train_interpolation"
+    ]
+    train_future = [
+        clip for clip in clips if clip.get("scene_id") == "002" and clip.get("setting") == "train_future"
+    ]
+    eval_future = [
+        clip for clip in clips if clip.get("scene_id") == "001" and clip.get("setting") == "eval_future"
+    ]
+    assert len(train_interp) == 12
+    assert len(train_future) == 6
+    assert len(eval_future) == 4
+
+    clip = eval_future[0]
     assert clip["scene_id"] == "001"
     assert clip["fps"] == 10.0
-    assert len(clip["frame_ids"]) == 15
+    assert clip["clip_len_frames"] == 16
+    assert len(clip["frame_ids"]) == 16
     assert clip["views"] == ["front_camera"]
-    assert len(clip["image_paths"]["front_camera"]) == 15
+    assert len(clip["image_paths"]["front_camera"]) == 16

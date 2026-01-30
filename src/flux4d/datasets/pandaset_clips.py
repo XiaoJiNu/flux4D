@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass
 import json
 import pickle
 import random
@@ -12,6 +13,73 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 ClipEntry = Dict[str, object]
+
+PANDASET_PAPER_TEST_SCENES: Tuple[str, ...] = (
+    "001",
+    "011",
+    "016",
+    "065",
+    "084",
+    "090",
+    "106",
+    "115",
+    "123",
+    "158",
+)
+
+
+@dataclass(frozen=True)
+class ClipSetting:
+    """clip 切片设置（对齐论文/补充材料）。"""
+
+    name: str
+    clip_len_frames: int
+    stride_frames: int
+    input_frame_indices: Tuple[int, ...]
+    target_frame_indices: Tuple[int, ...]
+    splits: Tuple[str, ...]
+    max_clips_per_scene: Optional[int] = None
+
+
+def build_pandaset_paper_settings() -> List[ClipSetting]:
+    """构建论文/补充材料一致的切片设置列表。
+
+    Returns:
+        切片设置列表。
+
+    Note:
+        - Interpolation training：1s snippet（11 帧）+ 5 帧 overlap → stride=6。
+        - Future training：1.5s snippet（16 帧）+ 5 帧 overlap → stride=11。
+        - Eval：每 20 帧采样一个 1.5s snippet（16 帧），每个 log 取最多 4 个片段。
+    """
+    input_frames = (0, 2, 4, 6, 8, 10)
+    return [
+        ClipSetting(
+            name="train_interpolation",
+            clip_len_frames=11,
+            stride_frames=6,
+            input_frame_indices=input_frames,
+            target_frame_indices=(1, 3, 5, 7, 9),
+            splits=("train",),
+        ),
+        ClipSetting(
+            name="train_future",
+            clip_len_frames=16,
+            stride_frames=11,
+            input_frame_indices=input_frames,
+            target_frame_indices=(1, 3, 5, 7, 9, 11, 12, 13, 14, 15),
+            splits=("train",),
+        ),
+        ClipSetting(
+            name="eval_future",
+            clip_len_frames=16,
+            stride_frames=20,
+            input_frame_indices=input_frames,
+            target_frame_indices=(1, 3, 5, 7, 9, 11, 12, 13, 14, 15),
+            splits=("test",),
+            max_clips_per_scene=4,
+        ),
+    ]
 
 
 def _parse_frame_index(filename: str) -> Optional[int]:
@@ -178,10 +246,10 @@ def _select_val_scenes(scene_ids: List[str], val_count: int) -> List[str]:
 def _build_scene_clips(
     data_root: Path,
     scene_path: Path,
-    clip_len_s: float,
-    stride_s: float,
+    clip_settings: Sequence[ClipSetting],
     target_fps: Optional[float],
     val_scenes: Optional[Iterable[str]],
+    camera_names: Optional[Sequence[str]],
     strict: bool,
 ) -> List[ClipEntry]:
     """为单个场景构建 clip 记录。
@@ -189,10 +257,10 @@ def _build_scene_clips(
     Args:
         data_root: PandaSet 根目录。
         scene_path: 单个场景目录。
-        clip_len_s: 片段长度（秒）。
-        stride_s: 滑动步长（秒）。
+        clip_settings: clip 切片设置列表。
         target_fps: 目标帧率，None 则使用实际帧率。
-        val_scenes: 验证场景列表。
+        val_scenes: 测试场景列表。
+        camera_names: 需要保留的相机列表，None 表示保留全部。
         strict: 严格模式（异常即中断）。
 
     Returns:
@@ -239,17 +307,6 @@ def _build_scene_clips(
             raise ValueError(message)
         print(f"[warn] {message}")
 
-    clip_len_frames = max(1, int(round(clip_len_s * fps_target)))
-    stride_frames = max(1, int(round(stride_s * fps_target)))
-    if len(lidar_files) < clip_len_frames:
-        message = (
-            f"scene {scene_id} has {len(lidar_files)} frames < clip_len {clip_len_frames}"
-        )
-        if strict:
-            raise ValueError(message)
-        print(f"[warn] {message}")
-        return []
-
     cameras: Dict[str, Dict[str, object]] = {}
     for cam_dir in sorted(camera_root.iterdir()):
         if not cam_dir.is_dir():
@@ -282,6 +339,9 @@ def _build_scene_clips(
             "image_paths": _relative_paths(cam_files, data_root),
         }
 
+    if camera_names is not None:
+        cameras = {name: cameras[name] for name in camera_names if name in cameras}
+
     if not cameras:
         message = f"no cameras found for scene {scene_id}"
         if strict:
@@ -291,48 +351,74 @@ def _build_scene_clips(
 
     view_names = sorted(cameras.keys())
     val_scene_set = set(val_scenes) if val_scenes else set()
-    split = "val" if scene_id in val_scene_set else "train"
+    split = "test" if scene_id in val_scene_set else "train"
 
     entries: List[ClipEntry] = []
-    for start in range(0, len(lidar_files) - clip_len_frames + 1, stride_frames):
-        end = start + clip_len_frames
-        frame_ids = list(range(start, end))
-        entry: ClipEntry = {
-            "clip_id": f"{scene_id}_s{start:03d}_e{end - 1:03d}",
-            "scene_id": scene_id,
-            "split": split,
-            "fps": fps_target,
-            "fps_actual": fps_actual,
-            "clip_len_s": clip_len_s,
-            "stride_s": stride_s,
-            "frame_start": start,
-            "frame_end": end - 1,
-            "frame_ids": frame_ids,
-            "timestamps": {
-                "lidar": _slice_list(lidar_ts, start, end),
-                "camera": {
-                    cam: _slice_list(cameras[cam]["timestamps"], start, end)
+    for setting in clip_settings:
+        if split not in setting.splits:
+            continue
+        if len(lidar_files) < setting.clip_len_frames:
+            message = (
+                f"scene {scene_id} has {len(lidar_files)} frames < clip_len "
+                f"{setting.clip_len_frames} for setting {setting.name}"
+            )
+            if strict:
+                raise ValueError(message)
+            print(f"[warn] {message}")
+            continue
+
+        count_for_scene = 0
+        for start in range(
+            0, len(lidar_files) - setting.clip_len_frames + 1, setting.stride_frames
+        ):
+            if setting.max_clips_per_scene is not None and count_for_scene >= setting.max_clips_per_scene:
+                break
+            end = start + setting.clip_len_frames
+            frame_ids = list(range(start, end))
+            entry: ClipEntry = {
+                "clip_id": f"{scene_id}_{setting.name}_s{start:03d}_e{end - 1:03d}",
+                "scene_id": scene_id,
+                "split": split,
+                "setting": setting.name,
+                "fps": fps_target,
+                "fps_actual": fps_actual,
+                "clip_len_frames": setting.clip_len_frames,
+                "stride_frames": setting.stride_frames,
+                "clip_len_s": float(setting.clip_len_frames - 1) / float(fps_target),
+                "stride_s": float(setting.stride_frames) / float(fps_target),
+                "input_frame_indices": list(setting.input_frame_indices),
+                "target_frame_indices": list(setting.target_frame_indices),
+                "input_frame_ids": [start + idx for idx in setting.input_frame_indices],
+                "target_frame_ids": [start + idx for idx in setting.target_frame_indices],
+                "frame_start": start,
+                "frame_end": end - 1,
+                "frame_ids": frame_ids,
+                "timestamps": {
+                    "lidar": _slice_list(lidar_ts, start, end),
+                    "camera": {
+                        cam: _slice_list(cameras[cam]["timestamps"], start, end)
+                        for cam in view_names
+                    },
+                },
+                "intrinsics": {cam: cameras[cam]["intrinsics"] for cam in view_names},
+                "extrinsics": {
+                    "lidar": _slice_list(lidar_poses, start, end),
+                    "camera": {
+                        cam: _slice_list(cameras[cam]["extrinsics"], start, end)
+                        for cam in view_names
+                    },
+                },
+                "image_paths": {
+                    cam: _slice_list(cameras[cam]["image_paths"], start, end)
                     for cam in view_names
                 },
-            },
-            "intrinsics": {cam: cameras[cam]["intrinsics"] for cam in view_names},
-            "extrinsics": {
-                "lidar": _slice_list(lidar_poses, start, end),
-                "camera": {
-                    cam: _slice_list(cameras[cam]["extrinsics"], start, end)
-                    for cam in view_names
-                },
-            },
-            "image_paths": {
-                cam: _slice_list(cameras[cam]["image_paths"], start, end)
-                for cam in view_names
-            },
-            "lidar_paths": _slice_list(
-                _relative_paths(lidar_files, data_root), start, end
-            ),
-            "views": view_names,
-        }
-        entries.append(entry)
+                "lidar_paths": _slice_list(
+                    _relative_paths(lidar_files, data_root), start, end
+                ),
+                "views": view_names,
+            }
+            entries.append(entry)
+            count_for_scene += 1
     return entries
 
 
@@ -340,6 +426,7 @@ def build_pandaset_clip_index(
     data_root: str,
     out_pkl_full: str,
     out_pkl_tiny: str,
+    preset: str = "paper",
     clip_len_s: float = 1.5,
     stride_s: float = 1.5,
     target_fps: Optional[float] = 10.0,
@@ -347,6 +434,8 @@ def build_pandaset_clip_index(
     tiny_num_scenes: int = 2,
     val_scenes: Optional[Iterable[str]] = None,
     val_num_scenes: int = 10,
+    camera_names: Optional[Sequence[str]] = None,
+    clip_settings: Optional[Sequence[ClipSetting]] = None,
     max_scenes: Optional[int] = None,
     strict: bool = True,
 ) -> Tuple[int, int]:
@@ -356,13 +445,16 @@ def build_pandaset_clip_index(
         data_root: PandaSet 根目录。
         out_pkl_full: full 索引输出路径。
         out_pkl_tiny: tiny 索引输出路径。
+        preset: 切片预设，支持 "paper" 与 "debug"。
         clip_len_s: 片段长度（秒）。
         stride_s: 滑动步长（秒）。
         target_fps: 目标帧率，None 表示使用实际帧率。
         tiny_scenes: tiny 索引的场景列表。
         tiny_num_scenes: tiny 场景数量（仅在 tiny_scenes 为空时生效）。
-        val_scenes: 验证场景列表。
-        val_num_scenes: 验证场景数量（仅在 val_scenes 为空时生效）。
+        val_scenes: 测试场景列表。
+        val_num_scenes: 测试场景数量（仅在 val_scenes 为空时生效，仅 debug preset 使用）。
+        camera_names: 相机过滤列表，None 表示保留全部（paper preset 默认仅使用 front_camera）。
+        clip_settings: 自定义切片设置列表。None 表示使用 preset 的默认设置。
         max_scenes: 仅处理前 N 个场景（调试用）。
         strict: 严格模式（异常即中断）。
 
@@ -377,11 +469,40 @@ def build_pandaset_clip_index(
     if tiny_scenes is None:
         tiny_scenes = scene_ids[:tiny_num_scenes]
     tiny_set = set(tiny_scenes)
-    if val_scenes is None:
-        # 默认取排序靠后的场景，保持与论文习惯一致
-        val_scenes_list = _select_val_scenes(scene_ids, val_num_scenes)
+
+    if preset not in ("paper", "debug"):
+        raise ValueError(f"unsupported preset: {preset}")
+
+    if preset == "paper":
+        if val_scenes is None:
+            val_scenes_list = list(PANDASET_PAPER_TEST_SCENES)
+        else:
+            val_scenes_list = list(val_scenes)
+        if camera_names is None:
+            camera_names = ["front_camera"]
+        if clip_settings is None:
+            clip_settings = build_pandaset_paper_settings()
     else:
-        val_scenes_list = list(val_scenes)
+        if val_scenes is None:
+            # 默认取排序靠后的场景，保持与旧实现一致
+            val_scenes_list = _select_val_scenes(scene_ids, val_num_scenes)
+        else:
+            val_scenes_list = list(val_scenes)
+        if clip_settings is None:
+            # debug：按秒换算成帧数（注意：这与论文的 11/16 帧定义不同）
+            fps_for_frames = target_fps if target_fps is not None else 10.0
+            clip_len_frames = max(1, int(round(clip_len_s * fps_for_frames)))
+            stride_frames = max(1, int(round(stride_s * fps_for_frames)))
+            clip_settings = [
+                ClipSetting(
+                    name="debug",
+                    clip_len_frames=clip_len_frames,
+                    stride_frames=stride_frames,
+                    input_frame_indices=tuple(range(clip_len_frames)),
+                    target_frame_indices=tuple(),
+                    splits=("train", "test"),
+                )
+            ]
 
     out_full_path = Path(out_pkl_full)
     out_tiny_path = Path(out_pkl_tiny)
@@ -396,10 +517,10 @@ def build_pandaset_clip_index(
         entries = _build_scene_clips(
             data_root_path,
             scene_path,
-            clip_len_s,
-            stride_s,
+            clip_settings,
             target_fps,
             val_scenes_list,
+            camera_names,
             strict,
         )
         if not entries:
@@ -414,12 +535,18 @@ def build_pandaset_clip_index(
     full_payload: Dict[str, object] = {
         "meta": {
             "data_root": str(data_root_path),
-            "clip_len_s": clip_len_s,
-            "stride_s": stride_s,
+            "preset": preset,
             "target_fps": target_fps,
             "created_at": created_at,
             "scene_ids": scene_ids,
-            "val_scenes": val_scenes_list,
+            "test_scenes": val_scenes_list,
+            "camera_names": list(camera_names) if camera_names is not None else None,
+            "coord": {
+                "lidar_points_frame": "world",
+                "pose_convention": "sensor_to_world",
+                "ego0_frame_index": 0,
+            },
+            "settings": [asdict(setting) for setting in clip_settings],
             "total_clips": full_count,
         },
         "clips": full_entries,
@@ -427,12 +554,18 @@ def build_pandaset_clip_index(
     tiny_payload: Dict[str, object] = {
         "meta": {
             "data_root": str(data_root_path),
-            "clip_len_s": clip_len_s,
-            "stride_s": stride_s,
+            "preset": preset,
             "target_fps": target_fps,
             "created_at": created_at,
             "scene_ids": sorted(tiny_set),
-            "val_scenes": [scene for scene in val_scenes_list if scene in tiny_set],
+            "test_scenes": [scene for scene in val_scenes_list if scene in tiny_set],
+            "camera_names": list(camera_names) if camera_names is not None else None,
+            "coord": {
+                "lidar_points_frame": "world",
+                "pose_convention": "sensor_to_world",
+                "ego0_frame_index": 0,
+            },
+            "settings": [asdict(setting) for setting in clip_settings],
             "total_clips": tiny_count,
         },
         "clips": tiny_entries,

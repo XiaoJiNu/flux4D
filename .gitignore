@@ -27,3 +27,6 @@ assets/vis/
 # Local assistant context (not part of the project)
 GEMINI.md
 docs/数据处理与说明/pandaset数据说明.md
+
+# Scratch copies
+docs/开发记录/* copy.md
