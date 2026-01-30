@@ -52,6 +52,24 @@ python tools/vis/vis_lift_alignment.py \
 
 Outputs default to `assets/vis/lift_alignment/` (ignored by git).
 
+Note:
+
+- PandaSet LiDAR frames are stored as `.pkl.gz` pickles that require `pandas` to read.
+  If your default `python` cannot import a compatible `pandas`, run scripts under the `gaussianstorm`
+  conda env (or set `PYTHON=/home/yr/anaconda3/envs/gaussianstorm/bin/python` when using `make`).
+
+### Stage 3: Voxelization sanity check (numpy-only)
+
+Validate the stage3 voxelization pipeline (world → ego0, point_cloud_range filter, mean pooling):
+
+```bash
+python scripts/inspect_stage3_voxelization.py \
+  --config configs/flux4d.py \
+  --index-path data/metadata/pandaset_tiny_clips.pkl \
+  --clip-index 0 \
+  --num-sky-points 20000
+```
+
 ## Development notes
 
 - Keep reproducible commands in this file when new scripts are added.
