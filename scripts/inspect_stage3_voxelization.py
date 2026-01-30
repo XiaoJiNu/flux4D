@@ -135,6 +135,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=200000,
         help="Max number of points used for BEV scatter plot.",
     )
+    parser.add_argument(
+        "--plot-window-m",
+        type=float,
+        default=400.0,
+        help="BEV plot window size in meters (square side length, centered at ego0 origin).",
+    )
     return parser
 
 
@@ -156,6 +162,7 @@ def _save_bev_plot(
     point_cloud_range: Tuple[float, float, float, float, float, float],
     out_dir: Path,
     max_points: int,
+    plot_window_m: float,
 ) -> None:
     """保存 ego0 下的 BEV 散点图用于快速检查范围与分布。
 
@@ -175,11 +182,17 @@ def _save_bev_plot(
         return
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    if points_ego0.shape[0] > max_points:
-        idx = np.linspace(0, points_ego0.shape[0] - 1, max_points, dtype=np.int64)
-        sample = points_ego0[idx]
+    half = float(plot_window_m) * 0.5
+    if half <= 0:
+        raise ValueError("--plot-window-m 必须为正数")
+
+    in_view = (np.abs(points_ego0[:, 0]) <= half) & (np.abs(points_ego0[:, 1]) <= half)
+    visible = points_ego0[in_view]
+    if visible.shape[0] > max_points:
+        idx = np.linspace(0, visible.shape[0] - 1, max_points, dtype=np.int64)
+        sample = visible[idx]
     else:
-        sample = points_ego0
+        sample = visible
 
     x_min, y_min, _, x_max, y_max, _ = [float(v) for v in point_cloud_range]
     fig = plt.figure(figsize=(8, 8))
@@ -187,9 +200,11 @@ def _save_bev_plot(
     ax.scatter(sample[:, 0], sample[:, 1], s=0.2, c="black", alpha=0.35, linewidths=0)
     ax.plot([x_min, x_max, x_max, x_min, x_min], [y_min, y_min, y_max, y_max, y_min], c="red", lw=1.5)
     ax.set_aspect("equal", adjustable="box")
+    ax.set_xlim(-half, half)
+    ax.set_ylim(-half, half)
     ax.set_xlabel("x (ego0)")
     ax.set_ylabel("y (ego0)")
-    ax.set_title("Stage3 voxelization sanity (ego0 BEV)")
+    ax.set_title(f"Stage3 voxelization sanity (ego0 BEV, window={plot_window_m:.0f}m)")
     ax.grid(True, lw=0.3, alpha=0.4)
     fig.tight_layout()
     fig.savefig(out_dir / "bev_xy.png", dpi=180)
@@ -281,6 +296,7 @@ def main() -> int:
             point_cloud_range=tuple(voxel_cfg["point_cloud_range"]),  # type: ignore[arg-type]
             out_dir=out_dir,
             max_points=int(args.max_plot_points),
+            plot_window_m=float(args.plot_window_m),
         )
         print(f"[done] wrote bev plot: {out_dir}")
     return 0

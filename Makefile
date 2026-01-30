@@ -16,4 +16,5 @@ stage3-voxel-sanity:
 	  --index-path data/metadata/pandaset_tiny_clips.pkl \
 	  --clip-index 0 \
 	  --num-sky-points 20000 \
-	  --out-dir assets/vis/stage3_voxel_sanity/clip_000
+	  --out-dir assets/vis/stage3_voxel_sanity/clip_000 \
+	  --plot-window-m 400
