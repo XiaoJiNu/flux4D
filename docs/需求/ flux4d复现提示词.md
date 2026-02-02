@@ -136,7 +136,7 @@
     - 函数：`build_initial_gaussians_for_clip(...)`
 - 模块：主网络（Flux4DModel）
 
-  - 文件：`src/flux4d/storm/flux4d_model.py`
+  - 文件：`src/flux4d/models/flux4d_model.py`
     - 函数：`forward(G_init) -> (G_refined, velocities, aux)`
 - 模块：渲染与光流
 

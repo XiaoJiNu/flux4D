@@ -30,7 +30,7 @@ from flux4d.lift.lift_lidar import (  # noqa: E402
     get_lidar_pose,
     build_initial_gaussians_for_clip_aggregated,
 )
-from flux4d.storm.gaussian_voxelizer import voxelize_points_numpy  # noqa: E402
+from flux4d.models.gaussian_voxelizer import voxelize_points_numpy  # noqa: E402
 from flux4d.utils.frames import build_frame_transform_numpy, transform_points_numpy  # noqa: E402
 
 

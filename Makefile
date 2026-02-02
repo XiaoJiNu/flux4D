@@ -18,3 +18,11 @@ stage3-voxel-sanity:
 	  --num-sky-points 20000 \
 	  --out-dir assets/vis/stage3_voxel_sanity/clip_000 \
 	  --plot-window-m 400
+
+.PHONY: stage3-overfit
+stage3-overfit:
+	$(PYTHON) scripts/train_flux4d.py \
+	  --config configs/flux4d.py \
+	  --index-path data/metadata/pandaset_tiny_clips.pkl \
+	  --clip-index 0 \
+	  --camera front_camera

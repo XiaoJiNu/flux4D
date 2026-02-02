@@ -193,6 +193,7 @@ cfg: Dict[str, Any] = dict(
         seed=42,
         log_every=20,
         save_every=200,
+        save_ckpt_every=1000,
         output_dir="assets/vis/stage3_overfit",
     ),
 )

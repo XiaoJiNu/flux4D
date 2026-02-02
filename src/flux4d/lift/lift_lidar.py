@@ -916,12 +916,14 @@ def build_initial_gaussians_for_clip(
     clip: Dict[str, object],
     data_root: str,
     frame_indices: Optional[Sequence[int]] = None,
+    timestamp_frame_indices: Optional[Sequence[int]] = None,
     view_names: Optional[Sequence[str]] = None,
     voxel_size: float = 0.2,
     knn_k: int = 3,
     default_color: Tuple[float, float, float] = (0.5, 0.5, 0.5),
     opacity_init: float = 0.5,
     random_seed: int = 0,
+    lidar_sensor_id: int = -1,
 ) -> List[GaussianSet]:
     """为 clip 内多个帧构建初始高斯集合。
 
@@ -929,12 +931,14 @@ def build_initial_gaussians_for_clip(
         clip: clip 元信息条目。
         data_root: PandaSet 根目录。
         frame_indices: 需要处理的帧索引列表，None 表示全帧。
+        timestamp_frame_indices: 用于时间戳归一化的帧索引列表，None 表示与 frame_indices 一致。
         view_names: 指定的相机名称列表，None 表示使用 clip 内视角。
         voxel_size: 体素下采样尺寸。
         knn_k: kNN 近邻数量。
         default_color: 未命中视角时的默认颜色。
         opacity_init: 初始不透明度（0~1）。
         random_seed: 随机种子（用于四元数初始化）。
+        lidar_sensor_id: 传感器 ID。`-1` 表示使用全部点，`0/1` 表示仅使用对应激光雷达子集。
 
     Returns:
         初始高斯集合列表。
@@ -953,19 +957,26 @@ def build_initial_gaussians_for_clip(
         frame_list = list(frame_indices)
 
     gaussians: List[GaussianSet] = []
+    if timestamp_frame_indices is None:
+        timestamp_indices = list(frame_list)
+    else:
+        timestamp_indices = list(timestamp_frame_indices)
     abs_timestamps: List[float] = []
-    for frame_index in frame_list:
+    for frame_index in timestamp_indices:
         abs_timestamps.append(get_lidar_timestamp(clip, frame_index))
     norm_timestamps = normalize_timestamps_to_unit_range(abs_timestamps)
+    timestamp_map = {idx: float(norm_timestamps[i]) for i, idx in enumerate(timestamp_indices)}
 
     rng = np.random.default_rng(random_seed)
-    for list_index, frame_index in enumerate(frame_list):
+    for frame_index in frame_list:
         if frame_index >= total_frames:
             raise ValueError("frame_index 超出范围")
         lidar_path = Path(data_root) / lidar_paths[frame_index]
-        points_lidar, _ = load_lidar_frame(str(lidar_path))
+        points_lidar, _ = load_lidar_frame(str(lidar_path), sensor_id=lidar_sensor_id)
         lidar_pose = get_lidar_pose(clip, frame_index)
-        frame_timestamp = float(norm_timestamps[list_index])
+        if frame_index not in timestamp_map:
+            raise ValueError("frame_index 不在 timestamp_frame_indices 中，无法解析归一化时间戳")
+        frame_timestamp = float(timestamp_map[frame_index])
         camera_views = build_camera_views(clip, frame_index, data_root, view_names)
         gaussians.append(
             build_initial_gaussians_for_frame(
@@ -987,6 +998,7 @@ def build_initial_gaussians_for_clip_aggregated(
     clip: Dict[str, object],
     data_root: str,
     frame_indices: Optional[Sequence[int]] = None,
+    timestamp_frame_indices: Optional[Sequence[int]] = None,
     view_names: Optional[Sequence[str]] = None,
     voxel_size: float = 0.2,
     knn_k: int = 3,
@@ -995,6 +1007,7 @@ def build_initial_gaussians_for_clip_aggregated(
     random_seed: int = 0,
     num_sky_points: int = 1_000_000,
     max_gaussians: Optional[int] = None,
+    lidar_sensor_id: int = -1,
 ) -> GaussianSet:
     """构建 clip 的聚合初始高斯集合（G_init），并按补充材料添加 sky 点。
 
@@ -1002,6 +1015,7 @@ def build_initial_gaussians_for_clip_aggregated(
         clip: clip 元信息条目。
         data_root: PandaSet 根目录。
         frame_indices: 需要处理的帧索引列表，None 表示全帧。
+        timestamp_frame_indices: 用于时间戳归一化的帧索引列表，None 表示与 frame_indices 一致。
         view_names: 指定的相机名称列表，None 表示使用 clip 内视角。
         voxel_size: 体素下采样尺寸。
         knn_k: kNN 近邻数量（补充材料默认 3）。
@@ -1010,6 +1024,7 @@ def build_initial_gaussians_for_clip_aggregated(
         random_seed: 随机种子（用于四元数与 sky 采样）。
         num_sky_points: sky 点数量（补充材料默认 1,000,000；调试可设为更小）。
         max_gaussians: 可选的高斯数量上限。若指定且最终高斯数量超过该值，则随机下采样到该上限。
+        lidar_sensor_id: 传感器 ID。`-1` 表示使用全部点，`0/1` 表示仅使用对应激光雷达子集。
 
     Returns:
         聚合后的初始高斯集合。
@@ -1022,12 +1037,14 @@ def build_initial_gaussians_for_clip_aggregated(
         clip=clip,
         data_root=data_root,
         frame_indices=frame_indices,
+        timestamp_frame_indices=timestamp_frame_indices,
         view_names=view_names,
         voxel_size=voxel_size,
         knn_k=knn_k,
         default_color=default_color,
         opacity_init=opacity_init,
         random_seed=random_seed,
+        lidar_sensor_id=lidar_sensor_id,
     )
     merged = concat_gaussian_sets(per_frame)
     sky_rng = np.random.default_rng(random_seed + 1)

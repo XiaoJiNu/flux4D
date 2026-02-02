@@ -1,6 +1,6 @@
 """坐标系与 SE(3) 变换工具（NumPy/Torch）。
 
-本模块用于在不同坐标系之间做一致的点/向量变换，避免在 Lift/Storm 等子模块中重复实现。
+本模块用于在不同坐标系之间做一致的点/向量变换，避免在 Lift/Models 等子模块中重复实现。
 
 约定：
 - `pose` 使用 PandaSet 的结构：包含 `position{x,y,z}` 与 `heading{w,x,y,z}`。
@@ -360,4 +360,3 @@ def build_frame_transform_torch(
     r_world_ego0 = t_world_ego0[:3, :3]
     r_ego0_world = r_world_ego0.transpose(0, 1)
     return t_world_ego0, t_ego0_world, r_world_ego0, r_ego0_world
-

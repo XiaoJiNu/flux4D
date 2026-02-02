@@ -8,7 +8,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from flux4d.storm.gaussian_voxelizer import voxelize_points_numpy  # noqa: E402
+from flux4d.models.gaussian_voxelizer import voxelize_points_numpy  # noqa: E402
 
 
 def test_voxelize_points_numpy_mean_pooling() -> None:
@@ -66,4 +66,3 @@ def test_voxelize_points_numpy_invalid_points() -> None:
     assert res.point2voxel.tolist() == [-1]
     assert res.voxel_coords_xyz.shape == (0, 3)
     assert res.voxel_features.shape == (0, 1)
-

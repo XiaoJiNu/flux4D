@@ -70,6 +70,40 @@ python scripts/inspect_stage3_voxelization.py \
   --num-sky-points 20000
 ```
 
+### Stage 3: Tiny clip overfit (training loop)
+
+Run a minimal stage3 training loop that connects:
+Lift(G_init) → Flux4D-base → gsplat rasterization → loss → backward.
+
+```bash
+python scripts/train_flux4d.py \
+  --config configs/flux4d.py \
+  --index-path data/metadata/pandaset_tiny_clips.pkl \
+  --clip-index 0 \
+  --camera front_camera \
+  --device cuda:0 \
+  --num-sky-points 20000 \
+  --max-gaussians 200000
+```
+
+To simulate a larger effective batch size without increasing peak memory, use gradient accumulation:
+
+```bash
+python scripts/train_flux4d.py --grad-accum-steps 4 ...
+```
+
+If you want to skip projected LiDAR depth supervision (faster debug):
+
+```bash
+python scripts/train_flux4d.py --no-projected-depth ...
+```
+
+The trainer writes debug renders under `cfg["train"]["output_dir"]/step_XXXXXX/` and saves checkpoints as
+`ckpt_step_XXXXXX.pt` (with `ckpt_last.pt` pointing to the latest checkpoint). To resume:
+
+```bash
+python scripts/train_flux4d.py --resume-from assets/vis/stage3_overfit/ckpt_last.pt ...
+```
 ## Development notes
 
 - Keep reproducible commands in this file when new scripts are added.

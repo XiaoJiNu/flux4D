@@ -18,8 +18,8 @@ except ModuleNotFoundError:  # pragma: no cover
     torch = None  # type: ignore[assignment]
     nn = None  # type: ignore[assignment]
 
-from flux4d.storm.gaussian_voxelizer import VoxelizationResultTorch, voxelize_points_torch
-from flux4d.storm.flux4d_unet import build_sparse_unet
+from flux4d.models.gaussian_voxelizer import VoxelizationResultTorch, voxelize_points_torch
+from flux4d.models.flux4d_unet import build_sparse_unet
 from flux4d.utils.frames import (
     build_frame_transform_torch,
     transform_points_torch,
@@ -154,7 +154,7 @@ class Flux4DBaseOutput:
     voxelization: VoxelizationResultTorch
 
 
-class Flux4DBaseModel(nn.Module):
+class Flux4DBaseModel(nn.Module if nn is not None else object):
     """Flux4D-base：稀疏 3D U-Net 预测高斯残差与速度。"""
 
     def __init__(self, cfg: Mapping[str, object]) -> None:
@@ -263,6 +263,7 @@ def build_flux4d_base_model(cfg: Mapping[str, object]) -> Flux4DBaseModel:
     Returns:
         Flux4DBaseModel 实例。
     """
+    _require_torch()
     return Flux4DBaseModel(cfg)
 
 
@@ -344,7 +345,7 @@ class Flux4DBaseOutputFrames:
     voxelization: VoxelizationResultTorch
 
 
-class Flux4DBaseModelFrames(nn.Module):
+class Flux4DBaseModelFrames(nn.Module if nn is not None else object):
     """Flux4D-base（坐标系封装）：输入 world，高斯体素化在 ego0，速度输出到 world。
 
     Note:
@@ -430,6 +431,7 @@ def build_flux4d_base_model_frames(cfg: Mapping[str, object]) -> Flux4DBaseModel
     Returns:
         Flux4DBaseModelFrames 实例。
     """
+    _require_torch_tensor()
     return Flux4DBaseModelFrames(cfg)
 
 
