@@ -104,6 +104,22 @@ The trainer writes debug renders under `cfg["train"]["output_dir"]/step_XXXXXX/`
 ```bash
 python scripts/train_flux4d.py --resume-from assets/vis/stage3_overfit/ckpt_last.pt ...
 ```
+
+### Stage 4: Rendered velocity sanity check
+
+Visualize image-plane rendered velocity `v_r` (used for dynamic reweighting in the supplementary A.1):
+
+```bash
+python tools/vis/vis_flow.py \
+  --config configs/flux4d.py \
+  --index-path data/metadata/pandaset_tiny_clips.pkl \
+  --clip-index 0 \
+  --camera front_camera \
+  --ckpt assets/vis/stage3_overfit_run2/ckpt_last.pt \
+  --out-dir assets/vis/stage4_flow_sanity/clip_000 \
+  --mode both --render-frames 0-15 --frame-ref 0
+```
+
 ## Development notes
 
 - Keep reproducible commands in this file when new scripts are added.

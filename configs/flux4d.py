@@ -168,6 +168,11 @@ cfg: Dict[str, Any] = dict(
             opacity="sigmoid",
             scale_clamp_m=[0.0, 1.0],
         ),
+        rendered_velocity=dict(
+            clip_mag_px=10.0,
+            eps=1e-6,
+            delta_t_mode="next_frame",
+        ),
     ),
     loss=dict(
         lambda_rgb=0.8,
