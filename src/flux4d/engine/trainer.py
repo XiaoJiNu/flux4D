@@ -10,10 +10,11 @@ Note:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import json
 import random
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, TextIO, Tuple
 
 import numpy as np
 
@@ -145,6 +146,7 @@ class Stage3OverfitArgs:
     camera_name: str
     device: str
     iters: int
+    fixed_target_frame_index: Optional[int]
     grad_accum_steps: int
     log_every: int
     save_every: int
@@ -208,6 +210,15 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
     target_frame_indices = _as_int_list(clip.get("target_frame_indices"), "target_frame_indices")
     if not target_frame_indices:
         raise ValueError("target_frame_indices 为空，无法做重建监督")
+
+    supervision_frame_indices = list(target_frame_indices)
+    if args.fixed_target_frame_index is not None:
+        fixed_frame_index = int(args.fixed_target_frame_index)
+        if fixed_frame_index not in target_frame_indices:
+            raise ValueError(
+                f"fixed_target_frame_index={fixed_frame_index} 不在 target_frame_indices={target_frame_indices}"
+            )
+        supervision_frame_indices = [fixed_frame_index]
 
     clip_len_frames = int(clip.get("clip_len_frames", 0))
     if clip_len_frames <= 0:
@@ -330,7 +341,7 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
 
     # 预加载 target 帧相机视图（图像+内外参），避免训练中频繁 IO。
     target_views: Dict[int, object] = {}
-    for frame_index in target_frame_indices:
+    for frame_index in supervision_frame_indices:
         views = build_camera_views(
             clip=clip,
             frame_index=frame_index,
@@ -344,7 +355,7 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
     # 预计算 projected LiDAR depth（稀疏），仅用于深度监督。
     target_depth_maps: Dict[int, Tuple["torch.Tensor", "torch.Tensor"]] = {}
     if use_depth:
-        for frame_index in target_frame_indices:
+        for frame_index in supervision_frame_indices:
             view = target_views[frame_index]
             image = view.image
             height, width = image.shape[:2]
@@ -376,6 +387,24 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    log_file: TextIO = (output_dir / "train.log").open("a", encoding="utf-8")
+
+    def _log(message: str) -> None:
+        """同时输出到终端与日志文件。
+
+        Args:
+            message: 待输出的日志文本（单行）。
+        """
+        print(message, flush=True)
+        log_file.write(message + "\n")
+        log_file.flush()
+
+    start_time = datetime.now().isoformat(timespec="seconds")
+    _log(
+        "[start] "
+        f"time={start_time} output_dir={output_dir} clip_index={args.clip_index} "
+        f"camera={args.camera_name} iters={args.iters} fixed_target_frame_index={args.fixed_target_frame_index}"
+    )
     (output_dir / "meta.json").write_text(
         json.dumps(
             {
@@ -385,6 +414,7 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
                     "iterative_refine": {"enabled": iterative_refine_enabled, "num_iters": refine_iters},
                     "velocity_reweighting": {"enabled": use_velocity_reweighting, "alpha_threshold": alpha_threshold},
                     "motion": {"poly_degree_l": poly_degree_l},
+                    "fixed_target_frame_index": args.fixed_target_frame_index,
                 },
                 "index_path": args.index_path,
                 "clip_index": args.clip_index,
@@ -421,9 +451,9 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
             missing = getattr(incompatible, "missing_keys", [])
             unexpected = getattr(incompatible, "unexpected_keys", [])
             if missing:
-                print(f"[resume] missing keys: {missing[:10]}{'...' if len(missing) > 10 else ''}")
+                _log(f"[resume] missing keys: {missing[:10]}{'...' if len(missing) > 10 else ''}")
             if unexpected:
-                print(f"[resume] unexpected keys: {unexpected[:10]}{'...' if len(unexpected) > 10 else ''}")
+                _log(f"[resume] unexpected keys: {unexpected[:10]}{'...' if len(unexpected) > 10 else ''}")
         else:
             model.load_state_dict(model_state)
         optimizer.load_state_dict(optimizer_state)
@@ -444,7 +474,7 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
                 torch.cuda.set_rng_state_all(cuda_state)  # type: ignore[arg-type]
 
         start_step = resume_step + 1
-        print(f"[resume] from={resume_from} step={resume_step}")
+        _log(f"[resume] from={resume_from} step={resume_step}")
 
     def _save_last_symlink(checkpoint_path: Path) -> None:
         """创建/更新 output_dir/ckpt_last.pt -> checkpoint_path.name。"""
@@ -558,7 +588,10 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
         last_target_valid = None
 
         for _ in range(accum_steps):
-            frame_index = random.choice(target_frame_indices)
+            if args.fixed_target_frame_index is None:
+                frame_index = random.choice(supervision_frame_indices)
+            else:
+                frame_index = int(args.fixed_target_frame_index)
             view = target_views[frame_index]
             t_target = torch.tensor(float(norm_lidar_ts[frame_index]), device=device, dtype=dtype)
 
@@ -742,7 +775,7 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
 
         if step % int(args.log_every) == 0 or step == 1:
             denom = float(max(1, int(args.grad_accum_steps)))
-            print(
+            _log(
                 f"[{step:06d}] total={float(total_sum) / denom:.6f} "
                 f"rgb={float(rgb_sum) / denom:.6f} ssim={float(ssim_value_sum) / denom:.4f} "
                 f"depth={float(depth_sum) / denom:.6f} vel={float(vel_sum) / denom:.6f} "
@@ -764,3 +797,7 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
         save_ckpt_every = int(args.save_ckpt_every)
         if step == int(args.iters) or (save_ckpt_every > 0 and step % save_ckpt_every == 0):
             _save_checkpoint(step)
+
+    end_time = datetime.now().isoformat(timespec="seconds")
+    _log(f"[done] time={end_time} step={args.iters}")
+    log_file.close()

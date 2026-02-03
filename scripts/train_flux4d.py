@@ -78,6 +78,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda:0", help="Torch device, e.g. cuda:0.")
     parser.add_argument("--iters", type=int, default=0, help="Override train iters (0 uses cfg['train']).")
     parser.add_argument(
+        "--fixed-target-frame",
+        type=int,
+        default=-1,
+        help=(
+            "固定 overfit 的 target 帧索引（非负数表示 clip 内的 frame_index）。"
+            "当为负数时，训练将从 target_frame_indices 中随机采样。"
+        ),
+    )
+    parser.add_argument(
         "--grad-accum-steps",
         type=int,
         default=1,
@@ -156,6 +165,12 @@ def main() -> int:
         save_ckpt_every = int(train_cfg.get("save_ckpt_every", 0))
     output_dir = args.output_dir or str(train_cfg.get("output_dir", "assets/vis/stage3_overfit"))
 
+    fixed_target_frame_index: Optional[int]
+    if int(args.fixed_target_frame) >= 0:
+        fixed_target_frame_index = int(args.fixed_target_frame)
+    else:
+        fixed_target_frame_index = None
+
     sky_cfg = init_cfg.get("sky")
     num_sky_points: int
     if args.num_sky_points >= 0:
@@ -179,6 +194,7 @@ def main() -> int:
         camera_name=str(args.camera),
         device=str(args.device),
         iters=iters,
+        fixed_target_frame_index=fixed_target_frame_index,
         grad_accum_steps=int(args.grad_accum_steps),
         log_every=log_every,
         save_every=save_every,
