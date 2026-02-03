@@ -254,6 +254,134 @@ class Flux4DBaseModel(nn.Module if nn is not None else object):
         )
 
 
+@dataclass(frozen=True)
+class Flux4DRefineOutput:
+    """Flux4D refinement（r_θ）输出。"""
+
+    delta_g: "torch.Tensor"
+    voxelization: VoxelizationResultTorch
+
+
+class Flux4DRefineModel(nn.Module if nn is not None else object):
+    """Flux4D refinement（r_θ）：输入 (G, T, ∇G) 预测残差 ΔG。
+
+    对齐补充材料 A.2/A.3 Algorithm 2：refinement 网络与 base 网络使用相同的稀疏 3D U-Net
+    架构，但额外接收上一轮的高斯梯度 `G_grad` 作为输入特征。
+    """
+
+    def __init__(self, cfg: Mapping[str, object]) -> None:
+        super().__init__()
+        _require_torch()
+
+        model_cfg = cfg.get("model")
+        voxel_cfg = cfg.get("voxel")
+        if not isinstance(model_cfg, Mapping):
+            raise ValueError("cfg['model'] 缺失或格式非法")
+        if not isinstance(voxel_cfg, Mapping):
+            raise ValueError("cfg['voxel'] 缺失或格式非法")
+
+        gaussian_dim = int(model_cfg.get("gaussian_dim", 14))
+        time_dim = int(model_cfg.get("time_dim", 1))
+        if gaussian_dim != 14 or time_dim != 1:
+            raise ValueError("阶段5默认输入维度应为 gaussian_dim=14, time_dim=1")
+
+        self._point_cloud_range = list(voxel_cfg["point_cloud_range"])
+        self._voxel_size = list(voxel_cfg["voxel_size"])
+
+        unet_cfg = model_cfg.get("unet")
+        if not isinstance(unet_cfg, dict):
+            raise ValueError("cfg['model']['unet'] 缺失或格式非法")
+        in_channels = gaussian_dim + time_dim + gaussian_dim
+        self._unet = build_sparse_unet(in_channels=in_channels, cfg_dict=unet_cfg)
+
+        head_cfg = model_cfg.get("head")
+        if not isinstance(head_cfg, Mapping):
+            raise ValueError("cfg['model']['head'] 缺失或格式非法")
+        delta_g_dim = int(head_cfg.get("delta_g_dim", 14))
+
+        unet_out_channels = int(unet_cfg["out_channels"])
+        self._delta_head = nn.Linear(unet_out_channels, delta_g_dim)
+
+    def forward(self, gaussians: TorchGaussianSet, gaussians_grad: "torch.Tensor") -> Flux4DRefineOutput:
+        """前向：体素化 (G,T,∇G) -> Sparse U-Net -> 点级 ΔG。
+
+        Args:
+            gaussians: 当前迭代的高斯集合（G）。
+            gaussians_grad: 当前高斯参数的梯度 (N, 14)，作为 refinement 输入特征（∇G）。
+
+        Returns:
+            Flux4DRefineOutput。
+        """
+        _require_torch()
+        if gaussians_grad.ndim != 2 or int(gaussians_grad.shape[1]) != 14:
+            raise ValueError("gaussians_grad 形状必须为 (N, 14)")
+        if int(gaussians_grad.shape[0]) != int(gaussians.positions.shape[0]):
+            raise ValueError("gaussians_grad 与 gaussians 的 N 不一致")
+
+        g_param = gaussians.as_param_tensor()
+        t = gaussians.timestamps[:, None]
+        point_features = torch.cat([g_param, t, gaussians_grad], dim=-1)
+
+        voxelization = voxelize_points_torch(
+            points_xyz=gaussians.positions,
+            features=point_features,
+            point_cloud_range=self._point_cloud_range,
+            voxel_size=self._voxel_size,
+            build_spconv=True,
+        )
+        if voxelization.spconv_tensor is None:
+            raise ModuleNotFoundError("未检测到 spconv，无法构建 SparseConvTensor 以运行 Sparse U-Net")
+
+        voxel_out = self._unet(voxelization.spconv_tensor)
+        voxel_out_features = getattr(voxel_out, "features")
+
+        n_points = gaussians.positions.shape[0]
+        out_dim = int(voxel_out_features.shape[1])
+        point_feat_out = torch.zeros((n_points, out_dim), device=voxel_out_features.device, dtype=voxel_out_features.dtype)
+        valid_idx = torch.where(voxelization.valid_mask)[0]
+        if valid_idx.numel() > 0:
+            point_feat_out[valid_idx] = voxel_out_features[voxelization.point2voxel[valid_idx]]
+
+        delta_g = self._delta_head(point_feat_out)
+        return Flux4DRefineOutput(delta_g=delta_g, voxelization=voxelization)
+
+
+def apply_delta_g_to_gaussians(gaussians: TorchGaussianSet, delta_g: "torch.Tensor") -> TorchGaussianSet:
+    """将 `ΔG` 残差应用到高斯集合并规范化四元数。
+
+    Args:
+        gaussians: 输入高斯集合（G）。
+        delta_g: 残差张量 (N, 14)。
+
+    Returns:
+        更新后的高斯集合（G + ΔG）。
+
+    Raises:
+        ValueError: 输入形状不匹配。
+    """
+    _require_torch_tensor()
+    if delta_g.ndim != 2 or int(delta_g.shape[1]) != 14:
+        raise ValueError("delta_g 形状必须为 (N, 14)")
+    if int(delta_g.shape[0]) != int(gaussians.positions.shape[0]):
+        raise ValueError("delta_g 与 gaussians 的 N 不一致")
+
+    g_param = gaussians.as_param_tensor()
+    updated = g_param + delta_g
+    pos = updated[:, 0:3]
+    rot = _normalize_quaternions(updated[:, 3:7])
+    scale = updated[:, 7:10]
+    opacity = updated[:, 10]
+    color = updated[:, 11:14]
+    return TorchGaussianSet(
+        positions=pos,
+        rotations=rot,
+        scales=scale,
+        opacities=opacity,
+        colors=color,
+        timestamps=gaussians.timestamps,
+    )
+
+
 def build_flux4d_base_model(cfg: Mapping[str, object]) -> Flux4DBaseModel:
     """从统一配置构建 Flux4D-base 模型。
 
@@ -265,6 +393,19 @@ def build_flux4d_base_model(cfg: Mapping[str, object]) -> Flux4DBaseModel:
     """
     _require_torch()
     return Flux4DBaseModel(cfg)
+
+
+def build_flux4d_refine_model(cfg: Mapping[str, object]) -> Flux4DRefineModel:
+    """从统一配置构建 Flux4D refinement（r_θ）模型。
+
+    Args:
+        cfg: `configs/flux4d.py` 中的 cfg 字典。
+
+    Returns:
+        Flux4DRefineModel 实例。
+    """
+    _require_torch()
+    return Flux4DRefineModel(cfg)
 
 
 @dataclass(frozen=True)

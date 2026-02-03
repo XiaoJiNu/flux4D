@@ -302,9 +302,21 @@ def _run_mode(
     torch = _require_torch()
     from flux4d.render.flux4d_renderer import activate_gaussians_for_render  # noqa: E402
     from flux4d.render.flux4d_renderer import apply_linear_motion  # noqa: E402
+    from flux4d.render.flux4d_renderer import apply_polynomial_motion  # noqa: E402
     from flux4d.render.flux4d_renderer import build_pinhole_camera_from_pandaset  # noqa: E402
     from flux4d.render.flux4d_renderer import render_gsplat  # noqa: E402
     from flux4d.render.flux4d_renderer import render_rendered_velocity_map  # noqa: E402
+
+    model_cfg = cfg.get("model")
+    if not isinstance(model_cfg, Mapping):
+        raise ValueError("cfg['model'] 缺失或格式非法")
+    head_cfg = model_cfg.get("head")
+    if not isinstance(head_cfg, Mapping):
+        raise ValueError("cfg['model']['head'] 缺失或格式非法")
+    motion_cfg = head_cfg.get("motion")
+    if not isinstance(motion_cfg, Mapping):
+        raise ValueError("cfg['model']['head']['motion'] 缺失或格式非法")
+    poly_degree_l = int(motion_cfg.get("poly_degree_l", 0))
 
     render_cfg = cfg.get("render")
     if not isinstance(render_cfg, Mapping):
@@ -339,7 +351,10 @@ def _run_mode(
         )
 
         t_target = torch.tensor(float(t_norm[frame_index]), device=device, dtype=dtype)
-        gaussians_t = apply_linear_motion(gaussians_world_out, velocities_world, t_target)
+        if poly_degree_l <= 0:
+            gaussians_t = apply_linear_motion(gaussians_world_out, velocities_world, t_target)
+        else:
+            gaussians_t = apply_polynomial_motion(gaussians_world_out, velocities_world, t_target)
         gaussians_act = activate_gaussians_for_render(gaussians_t, cfg)
 
         render_out = render_gsplat(
@@ -361,6 +376,7 @@ def _run_mode(
             camera=camera,
             cfg=cfg,
             delta_t_norm=delta_t_norm,
+            t_target_norm=float(t_norm[frame_index]),
         )
 
         frame_dir = out_dir / f"frame_{frame_index:03d}"

@@ -59,7 +59,8 @@ def photometric_l1_loss(
         return diff.mean()
     if weight_map.shape != diff.shape:
         raise ValueError("weight_map 形状必须为 (H, W)")
-    denom = weight_map.sum().clamp_min(1e-8)
+    valid = weight_map > 0
+    denom = torch.count_nonzero(valid).clamp_min(1)
     return (diff * weight_map).sum() / denom
 
 
@@ -211,6 +212,7 @@ class Flux4DBaseLosses:
 def compute_flux4d_base_losses(
     pred_rgb: "torch.Tensor",
     target_rgb: "torch.Tensor",
+    rgb_weight_map: Optional["torch.Tensor"],
     pred_depth: Optional["torch.Tensor"],
     target_depth: Optional["torch.Tensor"],
     target_depth_valid: Optional["torch.Tensor"],
@@ -227,6 +229,7 @@ def compute_flux4d_base_losses(
     Args:
         pred_rgb: 预测 RGB (H, W, 3)。
         target_rgb: GT RGB (H, W, 3)。
+        rgb_weight_map: 可选的 RGB 像素权重图 (H, W)，用于阶段5的速度重加权。
         pred_depth: 预测深度 (H, W)，可为 None（当 render_mode 不输出深度时）。
         target_depth: GT 深度 (H, W)，可为 None（当不使用深度监督时）。
         target_depth_valid: GT 深度有效掩码 (H, W)，可为 None。
@@ -241,7 +244,7 @@ def compute_flux4d_base_losses(
         Flux4DBaseLosses。
     """
     _require_torch()
-    rgb_l1 = photometric_l1_loss(pred_rgb, target_rgb)
+    rgb_l1 = photometric_l1_loss(pred_rgb, target_rgb, weight_map=rgb_weight_map)
     ssim = ssim_loss(pred_rgb, target_rgb, window_size=ssim_window)
     if pred_depth is None or target_depth is None:
         depth_l1 = torch.zeros((), device=pred_rgb.device, dtype=pred_rgb.dtype)
@@ -255,4 +258,3 @@ def compute_flux4d_base_losses(
         + float(lambda_vel) * vel
     )
     return Flux4DBaseLosses(total=total, rgb_l1=rgb_l1, ssim=ssim, depth_l1=depth_l1, vel=vel)
-

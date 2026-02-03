@@ -36,15 +36,21 @@ from flux4d.lift.lift_lidar import (
 )
 from flux4d.losses.flux4d_losses import compute_flux4d_base_losses
 from flux4d.models.flux4d_model import (
+    TorchGaussianSet,
     build_frame_transform_from_ego0_pose,
     build_flux4d_base_model_frames,
+    build_flux4d_refine_model,
+    apply_delta_g_to_gaussians,
     torch_gaussian_set_from_numpy,
 )
 from flux4d.render.flux4d_renderer import (
+    CameraPinholeTorch,
     activate_gaussians_for_render,
     apply_linear_motion,
+    apply_polynomial_motion,
     build_pinhole_camera_from_pandaset,
     render_gsplat,
+    render_rendered_velocity_map,
 )
 
 
@@ -243,7 +249,43 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
     ego0_pose = get_lidar_pose(clip, ego0_frame_index)
     frame = build_frame_transform_from_ego0_pose(ego0_pose, device=device, dtype=dtype)
 
-    model = build_flux4d_base_model_frames(cfg).to(device=device)
+    model_cfg = cfg.get("model")
+    if not isinstance(model_cfg, Mapping):
+        raise ValueError("cfg['model'] 缺失或格式非法")
+    refine_cfg = model_cfg.get("iterative_refine")
+    iterative_refine_enabled = False
+    refine_iters = 1
+    if isinstance(refine_cfg, Mapping):
+        iterative_refine_enabled = bool(refine_cfg.get("enabled", False))
+        refine_iters = int(refine_cfg.get("num_iters", 3))
+    refine_iters = max(1, int(refine_iters))
+
+    head_cfg = model_cfg.get("head")
+    if not isinstance(head_cfg, Mapping):
+        raise ValueError("cfg['model']['head'] 缺失或格式非法")
+    motion_cfg = head_cfg.get("motion")
+    if not isinstance(motion_cfg, Mapping):
+        raise ValueError("cfg['model']['head']['motion'] 缺失或格式非法")
+    poly_degree_l = int(motion_cfg.get("poly_degree_l", 0))
+
+    base_model = build_flux4d_base_model_frames(cfg)
+    if iterative_refine_enabled:
+        refine_model = build_flux4d_refine_model(cfg)
+
+        class _Flux4DStage5Wrapper(torch.nn.Module):
+            """将 base/refine 合并为一个可保存 checkpoint 的 nn.Module。"""
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.base = base_model
+                self.refine = refine_model
+
+            def forward(self, gaussians: TorchGaussianSet, frame_transform: object) -> object:
+                return self.base(gaussians, frame_transform)
+
+        model = _Flux4DStage5Wrapper().to(device=device)
+    else:
+        model = base_model.to(device=device)
     model.train()
 
     optimizer_cfg = train_cfg.get("optimizer")
@@ -260,6 +302,13 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
     render_mode = str(render_cfg.get("mode", "RGB+ED"))
     near = float(render_cfg.get("near", 0.1))
     far = float(render_cfg.get("far", 200.0))
+    rv_cfg = render_cfg.get("rendered_velocity", {})
+    if rv_cfg is None:
+        rv_cfg = {}
+    if not isinstance(rv_cfg, Mapping):
+        raise ValueError("cfg['render']['rendered_velocity'] 格式非法")
+    clip_mag_px = float(rv_cfg.get("clip_mag_px", 10.0))
+    delta_t_mode = str(rv_cfg.get("delta_t_mode", "next_frame"))
 
     lambda_rgb = float(loss_cfg.get("lambda_rgb", 0.8))
     lambda_ssim = float(loss_cfg.get("lambda_ssim", 0.2))
@@ -271,6 +320,13 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
     use_depth = bool(args.use_projected_lidar_depth) and lambda_depth > 0.0
     if isinstance(depth_cfg, Mapping):
         use_depth = use_depth and bool(depth_cfg.get("use_projected_lidar_depth", True))
+
+    vrw_cfg = loss_cfg.get("velocity_reweighting")
+    use_velocity_reweighting = False
+    alpha_threshold = 1e-3
+    if isinstance(vrw_cfg, Mapping):
+        use_velocity_reweighting = bool(vrw_cfg.get("enabled", False))
+        alpha_threshold = float(vrw_cfg.get("alpha_threshold", 1e-3))
 
     # 预加载 target 帧相机视图（图像+内外参），避免训练中频繁 IO。
     target_views: Dict[int, object] = {}
@@ -323,7 +379,13 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
     (output_dir / "meta.json").write_text(
         json.dumps(
             {
-                "config": {"render_mode": render_mode, "use_depth": use_depth},
+                "config": {
+                    "render_mode": render_mode,
+                    "use_depth": use_depth,
+                    "iterative_refine": {"enabled": iterative_refine_enabled, "num_iters": refine_iters},
+                    "velocity_reweighting": {"enabled": use_velocity_reweighting, "alpha_threshold": alpha_threshold},
+                    "motion": {"poly_degree_l": poly_degree_l},
+                },
                 "index_path": args.index_path,
                 "clip_index": args.clip_index,
                 "clip_id": clip.get("clip_id"),
@@ -354,7 +416,16 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
         if not isinstance(optimizer_state, Mapping):
             raise ValueError("checkpoint 缺少/非法字段: optimizer_state")
 
-        model.load_state_dict(model_state)
+        if iterative_refine_enabled:
+            incompatible = model.load_state_dict(model_state, strict=False)
+            missing = getattr(incompatible, "missing_keys", [])
+            unexpected = getattr(incompatible, "unexpected_keys", [])
+            if missing:
+                print(f"[resume] missing keys: {missing[:10]}{'...' if len(missing) > 10 else ''}")
+            if unexpected:
+                print(f"[resume] unexpected keys: {unexpected[:10]}{'...' if len(unexpected) > 10 else ''}")
+        else:
+            model.load_state_dict(model_state)
         optimizer.load_state_dict(optimizer_state)
 
         rng_state = state.get("rng_state")
@@ -404,6 +475,71 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
         save_ckpt(state, ckpt_path)
         _save_last_symlink(ckpt_path)
 
+    def _compute_delta_t_norm(frame_index: int) -> float:
+        """计算 frame_index 对应的 Δt_norm（默认使用下一帧间隔）。"""
+        if delta_t_mode != "next_frame":
+            raise ValueError(f"不支持的 delta_t_mode: {delta_t_mode}")
+        if frame_index < 0 or frame_index >= len(norm_lidar_ts):
+            raise ValueError("frame_index 超出范围")
+        if len(norm_lidar_ts) <= 1:
+            return 1.0
+        if frame_index + 1 < len(norm_lidar_ts):
+            return float(norm_lidar_ts[frame_index + 1] - norm_lidar_ts[frame_index])
+        if frame_index - 1 >= 0:
+            return float(norm_lidar_ts[frame_index] - norm_lidar_ts[frame_index - 1])
+        return 1.0
+
+    def _camera_in_ego0(camera_world: CameraPinholeTorch) -> CameraPinholeTorch:
+        """将 world->cam 的 view 矩阵左乘 ego0->world，得到 ego0->cam。"""
+        view_ego0_to_cam = camera_world.viewmat_world_to_cam @ frame.t_world_ego0
+        return CameraPinholeTorch(
+            viewmat_world_to_cam=view_ego0_to_cam,
+            k=camera_world.k,
+            width=camera_world.width,
+            height=camera_world.height,
+        )
+
+    def _retain_gaussian_param_grads(gaussians: TorchGaussianSet) -> None:
+        """对 G 的字段调用 retain_grad，便于在 backward 后读取 ∇G。"""
+        for tensor in (
+            gaussians.positions,
+            gaussians.rotations,
+            gaussians.scales,
+            gaussians.opacities,
+            gaussians.colors,
+        ):
+            if tensor.requires_grad:
+                tensor.retain_grad()
+
+    def _extract_gaussian_param_grads(gaussians: TorchGaussianSet) -> "torch.Tensor":
+        """拼接得到 ∇G（N,14），顺序与 G 的拼接一致。"""
+        grads = []
+        for name, tensor in (
+            ("positions", gaussians.positions),
+            ("rotations", gaussians.rotations),
+            ("scales", gaussians.scales),
+            ("opacities", gaussians.opacities),
+            ("colors", gaussians.colors),
+        ):
+            if tensor.grad is None:
+                raise ValueError(f"未获取到 {name}.grad，请确认已调用 retain_grad 且该字段参与了 loss 计算")
+            if name == "opacities":
+                grads.append(tensor.grad[:, None])
+            else:
+                grads.append(tensor.grad)
+        return torch.cat(grads, dim=-1)
+
+    def _detach_gaussians(gaussians: TorchGaussianSet) -> TorchGaussianSet:
+        """对高斯字段做 detach（用于阶段5迭代 refinement 的下一轮输入）。"""
+        return TorchGaussianSet(
+            positions=gaussians.positions.detach(),
+            rotations=gaussians.rotations.detach(),
+            scales=gaussians.scales.detach(),
+            opacities=gaussians.opacities.detach(),
+            colors=gaussians.colors.detach(),
+            timestamps=gaussians.timestamps.detach(),
+        )
+
     for step in range(int(start_step), int(args.iters) + 1):
         accum_steps = max(1, int(args.grad_accum_steps))
         optimizer.zero_grad(set_to_none=True)
@@ -426,68 +562,181 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
             view = target_views[frame_index]
             t_target = torch.tensor(float(norm_lidar_ts[frame_index]), device=device, dtype=dtype)
 
-            out = model(gaussians_world, frame)
-            gaussians_t = apply_linear_motion(out.gaussians_world, out.velocities_world, t_target)
-            gaussians_t = activate_gaussians_for_render(gaussians_t, cfg)
-
             image = view.image
             height, width = image.shape[:2]
-            camera = build_pinhole_camera_from_pandaset(
+            camera_world = build_pinhole_camera_from_pandaset(
                 intrinsics=view.intrinsics,
                 pose_cam=view.pose,
                 image_size=(width, height),
                 device=device,
                 dtype=dtype,
             )
-            render_out = render_gsplat(
-                gaussians_t,
-                camera,
-                near=near,
-                far=far,
-                render_mode=render_mode,
-            )
-            if render_out.rgb is None:
-                raise ValueError("render_mode 未输出 RGB，无法进行光度监督")
-            pred_rgb = render_out.rgb
             target_rgb = torch.from_numpy(image).to(device=device, dtype=dtype)
 
-            pred_depth = render_out.depth
             target_depth = None
             target_valid = None
-            if use_depth and pred_depth is not None:
+            if use_depth:
                 target_depth, target_valid = target_depth_maps[frame_index]
 
-            losses = compute_flux4d_base_losses(
-                pred_rgb=pred_rgb,
-                target_rgb=target_rgb,
-                pred_depth=pred_depth,
-                target_depth=target_depth,
-                target_depth_valid=target_valid,
-                velocities_world=out.velocities_world,
-                lambda_rgb=lambda_rgb,
-                lambda_ssim=lambda_ssim,
-                lambda_depth=lambda_depth,
-                lambda_vel=lambda_vel,
-                ssim_window=ssim_window,
-            )
-            (losses.total / float(accum_steps)).backward()
+            if iterative_refine_enabled:
+                camera = _camera_in_ego0(camera_world)
+                delta_t_norm = _compute_delta_t_norm(frame_index) if use_velocity_reweighting else 1.0
 
-            with torch.no_grad():
-                mse = torch.mean((pred_rgb - target_rgb) ** 2).clamp_min(1e-12)
-                psnr = -10.0 * torch.log10(mse)
-                ssim_value = 1.0 - losses.ssim
-                total_sum += losses.total.detach()
-                rgb_sum += losses.rgb_l1.detach()
-                ssim_value_sum += ssim_value.detach()
-                depth_sum += losses.depth_l1.detach()
-                vel_sum += losses.vel.detach()
-                psnr_sum += psnr.detach()
+                gaussians_iter: Optional[TorchGaussianSet] = None
+                velocities_iter: Optional["torch.Tensor"] = None
+                gaussians_grad: Optional["torch.Tensor"] = None
 
-            last_pred_rgb = pred_rgb
-            last_target_rgb = target_rgb
-            last_pred_depth = pred_depth
-            last_target_depth = target_depth
-            last_target_valid = target_valid
+                for refine_step in range(refine_iters):
+                    if refine_step == 0:
+                        base_out = model(gaussians_world, frame)
+                        gaussians_iter = base_out.gaussians_ego0
+                        velocities_iter = base_out.velocities_ego0
+                    else:
+                        if gaussians_iter is None or velocities_iter is None or gaussians_grad is None:
+                            raise ValueError("迭代 refinement 状态非法：缺少 gaussians/velocities/gaussians_grad")
+                        gaussians_in = _detach_gaussians(gaussians_iter)
+                        refine_out = model.refine(gaussians_in, gaussians_grad)
+                        gaussians_iter = apply_delta_g_to_gaussians(gaussians_in, refine_out.delta_g)
+                        velocities_iter = velocities_iter.detach()
+
+                    if gaussians_iter is None or velocities_iter is None:
+                        raise ValueError("gaussians_iter/velocities_iter 为空，训练过程异常")
+                    _retain_gaussian_param_grads(gaussians_iter)
+
+                    if poly_degree_l <= 0:
+                        gaussians_t = apply_linear_motion(gaussians_iter, velocities_iter, t_target)
+                    else:
+                        gaussians_t = apply_polynomial_motion(gaussians_iter, velocities_iter, t_target)
+                    gaussians_act = activate_gaussians_for_render(gaussians_t, cfg)
+
+                    render_out = render_gsplat(
+                        gaussians_act,
+                        camera,
+                        near=near,
+                        far=far,
+                        render_mode=render_mode,
+                    )
+                    if render_out.rgb is None:
+                        raise ValueError("render_mode 未输出 RGB，无法进行光度监督")
+                    pred_rgb = render_out.rgb
+                    pred_depth = render_out.depth
+
+                    rgb_weight_map = None
+                    if use_velocity_reweighting:
+                        vr_out = render_rendered_velocity_map(
+                            gaussians_world_t=gaussians_t,
+                            velocities_world=velocities_iter,
+                            camera=camera,
+                            cfg=cfg,
+                            delta_t_norm=float(delta_t_norm),
+                            t_target_norm=float(t_target.item()),
+                        )
+                        valid_mask = render_out.alpha > float(alpha_threshold)
+                        rgb_weight_map = (1.0 + vr_out.vr_mag.detach()).clamp(0.0, 1.0 + float(clip_mag_px))
+                        rgb_weight_map = rgb_weight_map * valid_mask.to(dtype=rgb_weight_map.dtype)
+
+                    losses = compute_flux4d_base_losses(
+                        pred_rgb=pred_rgb,
+                        target_rgb=target_rgb,
+                        rgb_weight_map=rgb_weight_map,
+                        pred_depth=pred_depth,
+                        target_depth=target_depth,
+                        target_depth_valid=target_valid,
+                        velocities_world=velocities_iter,
+                        lambda_rgb=lambda_rgb,
+                        lambda_ssim=lambda_ssim,
+                        lambda_depth=lambda_depth,
+                        lambda_vel=lambda_vel,
+                        ssim_window=ssim_window,
+                    )
+                    (losses.total / float(accum_steps * refine_iters)).backward()
+
+                    gaussians_grad = _extract_gaussian_param_grads(gaussians_iter).detach()
+
+                    with torch.no_grad():
+                        mse = torch.mean((pred_rgb - target_rgb) ** 2).clamp_min(1e-12)
+                        psnr = -10.0 * torch.log10(mse)
+                        ssim_value = 1.0 - losses.ssim
+                        total_sum += losses.total.detach() / float(refine_iters)
+                        rgb_sum += losses.rgb_l1.detach() / float(refine_iters)
+                        ssim_value_sum += ssim_value.detach() / float(refine_iters)
+                        depth_sum += losses.depth_l1.detach() / float(refine_iters)
+                        vel_sum += losses.vel.detach() / float(refine_iters)
+                        psnr_sum += psnr.detach() / float(refine_iters)
+
+                    last_pred_rgb = pred_rgb
+                    last_target_rgb = target_rgb
+                    last_pred_depth = pred_depth
+                    last_target_depth = target_depth
+                    last_target_valid = target_valid
+            else:
+                out = model(gaussians_world, frame)
+                velocities_world = out.velocities_world
+                if poly_degree_l <= 0:
+                    gaussians_t = apply_linear_motion(out.gaussians_world, velocities_world, t_target)
+                else:
+                    gaussians_t = apply_polynomial_motion(out.gaussians_world, velocities_world, t_target)
+                gaussians_act = activate_gaussians_for_render(gaussians_t, cfg)
+
+                render_out = render_gsplat(
+                    gaussians_act,
+                    camera_world,
+                    near=near,
+                    far=far,
+                    render_mode=render_mode,
+                )
+                if render_out.rgb is None:
+                    raise ValueError("render_mode 未输出 RGB，无法进行光度监督")
+                pred_rgb = render_out.rgb
+                pred_depth = render_out.depth
+
+                rgb_weight_map = None
+                if use_velocity_reweighting:
+                    delta_t_norm = _compute_delta_t_norm(frame_index)
+                    vr_out = render_rendered_velocity_map(
+                        gaussians_world_t=gaussians_t,
+                        velocities_world=velocities_world,
+                        camera=camera_world,
+                        cfg=cfg,
+                        delta_t_norm=float(delta_t_norm),
+                        t_target_norm=float(t_target.item()),
+                    )
+                    valid_mask = render_out.alpha > float(alpha_threshold)
+                    rgb_weight_map = (1.0 + vr_out.vr_mag.detach()).clamp(0.0, 1.0 + float(clip_mag_px))
+                    rgb_weight_map = rgb_weight_map * valid_mask.to(dtype=rgb_weight_map.dtype)
+
+                losses = compute_flux4d_base_losses(
+                    pred_rgb=pred_rgb,
+                    target_rgb=target_rgb,
+                    rgb_weight_map=rgb_weight_map,
+                    pred_depth=pred_depth,
+                    target_depth=target_depth,
+                    target_depth_valid=target_valid,
+                    velocities_world=velocities_world,
+                    lambda_rgb=lambda_rgb,
+                    lambda_ssim=lambda_ssim,
+                    lambda_depth=lambda_depth,
+                    lambda_vel=lambda_vel,
+                    ssim_window=ssim_window,
+                )
+                (losses.total / float(accum_steps)).backward()
+
+                with torch.no_grad():
+                    mse = torch.mean((pred_rgb - target_rgb) ** 2).clamp_min(1e-12)
+                    psnr = -10.0 * torch.log10(mse)
+                    ssim_value = 1.0 - losses.ssim
+                    total_sum += losses.total.detach()
+                    rgb_sum += losses.rgb_l1.detach()
+                    ssim_value_sum += ssim_value.detach()
+                    depth_sum += losses.depth_l1.detach()
+                    vel_sum += losses.vel.detach()
+                    psnr_sum += psnr.detach()
+
+                last_pred_rgb = pred_rgb
+                last_target_rgb = target_rgb
+                last_pred_depth = pred_depth
+                last_target_depth = target_depth
+                last_target_valid = target_valid
 
         optimizer.step()
 

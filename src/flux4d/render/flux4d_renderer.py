@@ -264,15 +264,18 @@ def render_rendered_velocity_map(
     *,
     cfg: Mapping[str, object],
     delta_t_norm: float,
+    t_target_norm: float,
 ) -> RenderedVelocityOutputsTorch:
     """渲染图像平面位移 `v_r`（对应 t'->t'+Δt_norm）。
 
     Args:
         gaussians_world_t: world 坐标系下推进到 t' 的高斯集合（仅 positions 应为 p_world(t')）。
-        velocities_world: world 坐标系速度张量 (N, vdim)，至少包含前三维线速度。
+        velocities_world: world 坐标系运动参数张量 (N, vdim)。当 `vdim>3` 时表示多项式速度参数，
+            渲染 `v_r` 时会先在 `t_target_norm` 处求瞬时速度 `v(t')`。
         camera: pinhole 相机参数（使用 t' 的相机 pose）。
         cfg: `configs/flux4d.py` 中的 cfg 字典（读取 render.near/far 与 rendered_velocity.clip_mag_px）。
         delta_t_norm: 归一化时间步长（相邻帧差）。
+        t_target_norm: 当前渲染时间 `t'`（归一化到 [0,1]）。
 
     Returns:
         RenderedVelocityOutputsTorch，包含 (v_r, |v_r|, alpha)。
@@ -293,9 +296,13 @@ def render_rendered_velocity_map(
     eps = float(rv_cfg.get("eps", 1e-6))
 
     gaussians_act = activate_gaussians_for_render(gaussians_world_t, cfg)
+    velocities_inst = evaluate_polynomial_velocity_torch(
+        motion_params_world=velocities_world,
+        t_target=torch.tensor(float(t_target_norm), device=velocities_world.device, dtype=velocities_world.dtype),
+    )
     vr_gauss = compute_rendered_velocity_per_gaussian_torch(
         points_world_t=gaussians_world_t.positions,
-        velocities_world=velocities_world,
+        velocities_world=velocities_inst,
         camera=camera,
         delta_t_norm=float(delta_t_norm),
         clip_mag=clip_mag,
@@ -314,6 +321,107 @@ def render_rendered_velocity_map(
     vr_map = vr_map * scale[..., None]
     vr_mag = vr_mag * scale
     return RenderedVelocityOutputsTorch(vr=vr_map, vr_mag=vr_mag, alpha=alpha)
+
+
+def evaluate_polynomial_velocity_torch(
+    motion_params_world: "torch.Tensor",
+    t_target: "torch.Tensor",
+) -> "torch.Tensor":
+    """在目标时间 `t_target` 处计算多项式速度的瞬时速度 `v(t_target)`。
+
+    补充材料 A.1 给出多项式运动模型的推进形式（积分），其对应的瞬时速度为：
+    `v(t) = Σ_{j=0..ℓ} v_j * t^j`，其中 `vdim = 3(ℓ+1)`。
+
+    Args:
+        motion_params_world: 运动参数 (N, vdim)，vdim 必须为 3 的倍数。
+        t_target: 目标时间标量或形状为 (N,) 的张量，范围建议为 [0,1]。
+
+    Returns:
+        瞬时线速度张量 (N, 3)，单位为 米 / 归一化时间。
+
+    Raises:
+        ValueError: 输入形状非法。
+    """
+    _require_torch()
+    if motion_params_world.ndim != 2:
+        raise ValueError("motion_params_world 形状必须为 (N, vdim)")
+    vdim = int(motion_params_world.shape[1])
+    if vdim < 3 or vdim % 3 != 0:
+        raise ValueError("motion_params_world 的 vdim 必须为 3 的倍数且至少为 3")
+
+    t_vec: "torch.Tensor"
+    if t_target.ndim == 0:
+        t_vec = t_target
+    elif t_target.ndim == 1 and int(t_target.shape[0]) == int(motion_params_world.shape[0]):
+        t_vec = t_target
+    else:
+        raise ValueError("t_target 必须为标量或形状为 (N,) 的张量")
+
+    chunks = motion_params_world.view(motion_params_world.shape[0], vdim // 3, 3)
+    v_inst = torch.zeros((motion_params_world.shape[0], 3), device=motion_params_world.device, dtype=motion_params_world.dtype)
+    for j in range(vdim // 3):
+        power = t_vec**j
+        v_inst = v_inst + chunks[:, j, :] * (power if power.ndim == 0 else power[:, None])
+    return v_inst
+
+
+def apply_polynomial_motion(
+    gaussians_world: TorchGaussianSet,
+    motion_params_world: "torch.Tensor",
+    t_target: "torch.Tensor",
+) -> TorchGaussianSet:
+    """对高斯中心应用多项式运动推进（补充材料 A.1 Eq.(2)）。
+
+    位置推进形式：
+    `p_i(t') = p_i(t_i) + Σ_{j=0..ℓ} v_{i,j} * (t'^{j+1} - t_i^{j+1})/(j+1)`，
+    其中 `vdim = 3(ℓ+1)`，`v_{i,j}∈R^3`。
+
+    Args:
+        gaussians_world: 高斯集合（位置为 p(t_i)，时间戳为 t_i∈[0,1]）。
+        motion_params_world: 多项式速度参数 (N, vdim)，vdim 必须为 3 的倍数。
+        t_target: 目标时间标量或形状为 (N,) 的张量，单位为归一化时间（[0,1]）。
+
+    Returns:
+        推进到 t_target 的高斯集合（仅 positions 更新，其余字段保持不变）。
+
+    Raises:
+        ValueError: 输入形状不匹配。
+    """
+    _require_torch()
+    if motion_params_world.ndim != 2:
+        raise ValueError("motion_params_world 形状必须为 (N, vdim)")
+    if motion_params_world.shape[0] != gaussians_world.positions.shape[0]:
+        raise ValueError("motion_params_world 与 gaussians_world 的 N 不一致")
+    vdim = int(motion_params_world.shape[1])
+    if vdim < 3 or vdim % 3 != 0:
+        raise ValueError("motion_params_world 的 vdim 必须为 3 的倍数且至少为 3")
+
+    t_i = gaussians_world.timestamps
+    if t_target.ndim == 0:
+        t_vec = t_target
+    elif t_target.ndim == 1 and t_target.shape[0] == t_i.shape[0]:
+        t_vec = t_target
+    else:
+        raise ValueError("t_target 必须为标量或形状为 (N,) 的张量")
+
+    terms = vdim // 3
+    chunks = motion_params_world.view(motion_params_world.shape[0], terms, 3)
+    delta_p = torch.zeros_like(gaussians_world.positions)
+    for j in range(terms):
+        exponent = j + 1
+        coeff = 1.0 / float(j + 1)
+        delta_scalar = (t_vec**exponent - t_i**exponent) * coeff
+        delta_p = delta_p + chunks[:, j, :] * delta_scalar[:, None]
+
+    positions = gaussians_world.positions + delta_p
+    return TorchGaussianSet(
+        positions=positions,
+        rotations=gaussians_world.rotations,
+        scales=gaussians_world.scales,
+        opacities=gaussians_world.opacities,
+        colors=gaussians_world.colors,
+        timestamps=gaussians_world.timestamps,
+    )
 
 def build_pinhole_camera_from_pandaset(
     intrinsics: Mapping[str, object],

@@ -180,6 +180,10 @@ cfg: Dict[str, Any] = dict(
         lambda_depth=0.01,
         lambda_vel=5e-3,
         ssim_window=11,
+        velocity_reweighting=dict(
+            enabled=False,
+            alpha_threshold=1e-3,
+        ),
         depth=dict(
             use_projected_lidar_depth=True,
         ),
