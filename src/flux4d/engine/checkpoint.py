@@ -55,12 +55,18 @@ def load_ckpt(
     path: Union[str, Path],
     *,
     map_location: Optional[object] = None,
+    weights_only: Optional[bool] = None,
 ) -> Dict[str, object]:
     """从磁盘加载 checkpoint。
 
     Args:
         path: checkpoint 文件路径。
         map_location: torch.load 的 map_location 参数（可将权重映射到 CPU/GPU）。
+        weights_only: 是否启用 PyTorch 的安全加载模式（weights-only）。
+            - 当为 None（默认）时，本项目按“训练断点续训”的需求加载完整 checkpoint，
+              等价于 `weights_only=False`（PyTorch 2.6 起默认值变更为 True，会导致包含
+              NumPy RNG 等状态的 checkpoint 无法加载）。
+            - 当为 True 时，仅允许加载安全白名单对象；通常只适用于“只保存 tensor 权重”的 checkpoint。
 
     Returns:
         checkpoint 状态字典。
@@ -73,8 +79,14 @@ def load_ckpt(
     ckpt_path = Path(path)
     if not ckpt_path.exists():
         raise FileNotFoundError(f"checkpoint 不存在: {ckpt_path}")
-    payload = torch.load(ckpt_path, map_location=map_location)
+    requested_weights_only = bool(weights_only) if weights_only is not None else False
+    try:
+        payload = torch.load(  # type: ignore[call-arg]
+            ckpt_path, map_location=map_location, weights_only=requested_weights_only
+        )
+    except TypeError:
+        # 兼容旧版本 PyTorch：torch.load 可能不支持 weights_only 参数。
+        payload = torch.load(ckpt_path, map_location=map_location)
     if not isinstance(payload, dict):
         raise ValueError("checkpoint 结构非法：期望 dict")
     return payload
-
