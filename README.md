@@ -92,14 +92,20 @@ To simulate a larger effective batch size without increasing peak memory, use gr
 python scripts/train_flux4d.py --grad-accum-steps 4 ...
 ```
 
+To truly overfit a single target frame (avoid multi-frame averaging blur), pin the supervision frame:
+
+```bash
+python scripts/train_flux4d.py --fixed-target-frame 1 ...
+```
+
 If you want to skip projected LiDAR depth supervision (faster debug):
 
 ```bash
 python scripts/train_flux4d.py --no-projected-depth ...
 ```
 
-The trainer writes debug renders under `cfg["train"]["output_dir"]/step_XXXXXX/` and saves checkpoints as
-`ckpt_step_XXXXXX.pt` (with `ckpt_last.pt` pointing to the latest checkpoint). To resume:
+The trainer writes `train.log` under `output_dir/`, debug renders under `output_dir/step_XXXXXX/`, and saves
+checkpoints as `ckpt_step_XXXXXX.pt` (with `ckpt_last.pt` pointing to the latest checkpoint). To resume:
 
 ```bash
 python scripts/train_flux4d.py --resume-from assets/vis/stage3_overfit/ckpt_last.pt ...
