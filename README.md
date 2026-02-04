@@ -111,6 +111,13 @@ checkpoints as `ckpt_step_XXXXXX.pt` (with `ckpt_last.pt` pointing to the latest
 python scripts/train_flux4d.py --resume-from assets/vis/stage3_overfit/ckpt_last.pt ...
 ```
 
+If the model parameter set changed (e.g. turning on iterative refinement), you may need to skip loading the
+optimizer state:
+
+```bash
+python scripts/train_flux4d.py --resume-from ... --resume-no-optim ...
+```
+
 ### Stage 4: Rendered velocity sanity check
 
 Visualize image-plane rendered velocity `v_r` (used for dynamic reweighting in the supplementary A.1):

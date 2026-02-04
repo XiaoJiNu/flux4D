@@ -146,6 +146,105 @@ def ssim_loss(
     return 1.0 - ssim_value
 
 
+def gaussian_blur_2d(
+    image_hw: "torch.Tensor",
+    *,
+    window_size: int,
+    sigma: float,
+) -> "torch.Tensor":
+    """对单通道 2D 图做高斯模糊。
+
+    Args:
+        image_hw: 输入图像，形状为 (H, W)。
+        window_size: 高斯窗口大小（正奇数）。
+        sigma: 高斯 sigma（必须为正数）。
+
+    Returns:
+        模糊后的图像，形状为 (H, W)。
+    """
+    _require_torch()
+    if image_hw.ndim != 2:
+        raise ValueError("image_hw 形状必须为 (H, W)")
+    if window_size <= 0 or window_size % 2 == 0:
+        raise ValueError("window_size 必须为正奇数")
+    if float(sigma) <= 0.0:
+        raise ValueError("sigma 必须为正数")
+
+    x = image_hw[None, None, ...]
+    window = _gaussian_window(
+        window_size,
+        float(sigma),
+        1,
+        device=image_hw.device,
+        dtype=image_hw.dtype,
+    )
+    out = torch_f.conv2d(x, window, padding=window_size // 2, groups=1)
+    return out[0, 0]
+
+
+def build_dynamic_weight_map_from_flow(
+    flow_or_mag: "torch.Tensor",
+    alpha: "torch.Tensor",
+    *,
+    alpha_threshold: float,
+    clip_mag: float,
+    blur_sigma: float = 0.0,
+    blur_window: int = 0,
+    eps: float = 1e-6,
+) -> "torch.Tensor":
+    """由渲染的 flow/velocity 构造动态重加权权重图（对齐补充材料 A.1）。
+
+    公式：`w = 1 + stop_grad(clip(||v_r||, 0, clip_mag))`，并仅在 `alpha > alpha_threshold`
+    的有效像素上启用。无效像素权重为 0。
+
+    Args:
+        flow_or_mag: 渲染的 2D 流/速度 (H, W, 2) 或其幅值图 (H, W)。
+        alpha: 渲染 alpha (H, W)。
+        alpha_threshold: 有效像素阈值（alpha > threshold）。
+        clip_mag: 幅值裁剪上限（像素）。
+        blur_sigma: 可选高斯模糊 sigma（<=0 表示不模糊）。
+        blur_window: 可选高斯模糊窗口大小（正奇数；<=0 时根据 sigma 自动推断）。
+        eps: 数值稳定项（避免除零）。
+
+    Returns:
+        权重图 (H, W)，dtype 与输入一致，且不参与反向传播（stop-grad）。
+    """
+    _require_torch()
+    if alpha.ndim != 2:
+        raise ValueError("alpha 形状必须为 (H, W)")
+    if float(clip_mag) <= 0.0:
+        raise ValueError("clip_mag 必须为正数")
+
+    if flow_or_mag.ndim == 3 and int(flow_or_mag.shape[2]) == 2:
+        mag = torch.sqrt(
+            torch.clamp(torch.sum(flow_or_mag * flow_or_mag, dim=-1), min=float(eps))
+        )
+    elif flow_or_mag.ndim == 2:
+        mag = flow_or_mag
+    else:
+        raise ValueError("flow_or_mag 形状必须为 (H, W, 2) 或 (H, W)")
+
+    if mag.shape != alpha.shape:
+        raise ValueError("flow_or_mag 与 alpha 的 (H, W) 必须一致")
+
+    valid = alpha > float(alpha_threshold)
+    mag = mag.clamp(0.0, float(clip_mag))
+    mag = torch.where(valid, mag, torch.zeros_like(mag))
+
+    if float(blur_sigma) > 0.0:
+        window_size = int(blur_window)
+        if window_size <= 0:
+            window_size = int(round(float(blur_sigma) * 6.0))
+            window_size = max(3, window_size)
+            if window_size % 2 == 0:
+                window_size += 1
+        mag = gaussian_blur_2d(mag, window_size=window_size, sigma=float(blur_sigma))
+        mag = torch.where(valid, mag, torch.zeros_like(mag))
+
+    weight = (1.0 + mag).detach()
+    return weight * valid.to(dtype=weight.dtype)
+
+
 def depth_l1_loss(
     pred_depth: "torch.Tensor",
     target_depth: "torch.Tensor",

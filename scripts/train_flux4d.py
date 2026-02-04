@@ -117,6 +117,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--resume-from", default="", help="Resume from a checkpoint path (ckpt_step_*.pt).")
     parser.add_argument(
+        "--resume-no-optim",
+        action="store_true",
+        help="Resume from a checkpoint but do not load optimizer/RNG state (useful when model params changed).",
+    )
+    parser.add_argument(
         "--num-sky-points",
         type=int,
         default=-1,
@@ -203,6 +208,7 @@ def main() -> int:
         max_gaussians=max_gaussians,
         use_projected_lidar_depth=not bool(args.no_projected_depth),
         resume_from=str(args.resume_from),
+        resume_optimizer=not bool(args.resume_no_optim),
         save_ckpt_every=save_ckpt_every,
     )
     train_stage3_overfit(cfg, train_args)

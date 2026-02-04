@@ -183,6 +183,8 @@ cfg: Dict[str, Any] = dict(
         velocity_reweighting=dict(
             enabled=False,
             alpha_threshold=1e-3,
+            blur_sigma=0.0,
+            blur_window=0,
         ),
         depth=dict(
             use_projected_lidar_depth=True,

@@ -36,6 +36,7 @@ from flux4d.lift.lift_lidar import (
     transform_lidar_to_camera,
 )
 from flux4d.losses.flux4d_losses import compute_flux4d_base_losses
+from flux4d.losses.flux4d_losses import build_dynamic_weight_map_from_flow
 from flux4d.models.flux4d_model import (
     TorchGaussianSet,
     build_frame_transform_from_ego0_pose,
@@ -155,6 +156,7 @@ class Stage3OverfitArgs:
     max_gaussians: Optional[int]
     use_projected_lidar_depth: bool
     resume_from: str
+    resume_optimizer: bool
     save_ckpt_every: int
 
 
@@ -335,9 +337,13 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
     vrw_cfg = loss_cfg.get("velocity_reweighting")
     use_velocity_reweighting = False
     alpha_threshold = 1e-3
+    blur_sigma = 0.0
+    blur_window = 0
     if isinstance(vrw_cfg, Mapping):
         use_velocity_reweighting = bool(vrw_cfg.get("enabled", False))
         alpha_threshold = float(vrw_cfg.get("alpha_threshold", 1e-3))
+        blur_sigma = float(vrw_cfg.get("blur_sigma", 0.0))
+        blur_window = int(vrw_cfg.get("blur_window", 0))
 
     # 预加载 target 帧相机视图（图像+内外参），避免训练中频繁 IO。
     target_views: Dict[int, object] = {}
@@ -412,7 +418,12 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
                     "render_mode": render_mode,
                     "use_depth": use_depth,
                     "iterative_refine": {"enabled": iterative_refine_enabled, "num_iters": refine_iters},
-                    "velocity_reweighting": {"enabled": use_velocity_reweighting, "alpha_threshold": alpha_threshold},
+                    "velocity_reweighting": {
+                        "enabled": use_velocity_reweighting,
+                        "alpha_threshold": alpha_threshold,
+                        "blur_sigma": blur_sigma,
+                        "blur_window": blur_window,
+                    },
                     "motion": {"poly_degree_l": poly_degree_l},
                     "fixed_target_frame_index": args.fixed_target_frame_index,
                 },
@@ -422,6 +433,7 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
                 "camera_name": args.camera_name,
                 "num_gaussians": int(gaussians_world.positions.shape[0]),
                 "resume_from": args.resume_from,
+                "resume_optimizer": bool(args.resume_optimizer),
                 "save_ckpt_every": int(args.save_ckpt_every),
             },
             ensure_ascii=False,
@@ -456,22 +468,31 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
                 _log(f"[resume] unexpected keys: {unexpected[:10]}{'...' if len(unexpected) > 10 else ''}")
         else:
             model.load_state_dict(model_state)
-        optimizer.load_state_dict(optimizer_state)
+        if bool(args.resume_optimizer):
+            try:
+                optimizer.load_state_dict(optimizer_state)
+            except ValueError as exc:
+                raise ValueError(
+                    "加载 optimizer_state 失败（可能是模型参数数量/结构变化导致）。"
+                    "如需仅加载模型权重，请在脚本中使用 --resume-no-optim。"
+                ) from exc
 
-        rng_state = state.get("rng_state")
-        if isinstance(rng_state, Mapping):
-            python_random_state = rng_state.get("python_random")
-            if python_random_state is not None:
-                random.setstate(python_random_state)  # type: ignore[arg-type]
-            numpy_state = rng_state.get("numpy")
-            if numpy_state is not None:
-                np.random.set_state(numpy_state)  # type: ignore[arg-type]
-            torch_state = rng_state.get("torch")
-            if torch_state is not None:
-                torch.random.set_rng_state(torch_state)  # type: ignore[arg-type]
-            cuda_state = rng_state.get("torch_cuda")
-            if cuda_state is not None:
-                torch.cuda.set_rng_state_all(cuda_state)  # type: ignore[arg-type]
+            rng_state = state.get("rng_state")
+            if isinstance(rng_state, Mapping):
+                python_random_state = rng_state.get("python_random")
+                if python_random_state is not None:
+                    random.setstate(python_random_state)  # type: ignore[arg-type]
+                numpy_state = rng_state.get("numpy")
+                if numpy_state is not None:
+                    np.random.set_state(numpy_state)  # type: ignore[arg-type]
+                torch_state = rng_state.get("torch")
+                if torch_state is not None:
+                    torch.random.set_rng_state(torch_state)  # type: ignore[arg-type]
+                cuda_state = rng_state.get("torch_cuda")
+                if cuda_state is not None:
+                    torch.cuda.set_rng_state_all(cuda_state)  # type: ignore[arg-type]
+        else:
+            _log("[resume] optimizer/rng skipped (model weights only)")
 
         start_step = resume_step + 1
         _log(f"[resume] from={resume_from} step={resume_step}")
@@ -586,6 +607,7 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
         last_pred_depth = None
         last_target_depth = None
         last_target_valid = None
+        last_rgb_weight_map = None
 
         for _ in range(accum_steps):
             if args.fixed_target_frame_index is None:
@@ -664,9 +686,14 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
                             delta_t_norm=float(delta_t_norm),
                             t_target_norm=float(t_target.item()),
                         )
-                        valid_mask = render_out.alpha > float(alpha_threshold)
-                        rgb_weight_map = (1.0 + vr_out.vr_mag.detach()).clamp(0.0, 1.0 + float(clip_mag_px))
-                        rgb_weight_map = rgb_weight_map * valid_mask.to(dtype=rgb_weight_map.dtype)
+                        rgb_weight_map = build_dynamic_weight_map_from_flow(
+                            vr_out.vr_mag,
+                            render_out.alpha,
+                            alpha_threshold=float(alpha_threshold),
+                            clip_mag=float(clip_mag_px),
+                            blur_sigma=float(blur_sigma),
+                            blur_window=int(blur_window),
+                        )
 
                     losses = compute_flux4d_base_losses(
                         pred_rgb=pred_rgb,
@@ -702,6 +729,7 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
                     last_pred_depth = pred_depth
                     last_target_depth = target_depth
                     last_target_valid = target_valid
+                    last_rgb_weight_map = rgb_weight_map
             else:
                 out = model(gaussians_world, frame)
                 velocities_world = out.velocities_world
@@ -734,9 +762,14 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
                         delta_t_norm=float(delta_t_norm),
                         t_target_norm=float(t_target.item()),
                     )
-                    valid_mask = render_out.alpha > float(alpha_threshold)
-                    rgb_weight_map = (1.0 + vr_out.vr_mag.detach()).clamp(0.0, 1.0 + float(clip_mag_px))
-                    rgb_weight_map = rgb_weight_map * valid_mask.to(dtype=rgb_weight_map.dtype)
+                    rgb_weight_map = build_dynamic_weight_map_from_flow(
+                        vr_out.vr_mag,
+                        render_out.alpha,
+                        alpha_threshold=float(alpha_threshold),
+                        clip_mag=float(clip_mag_px),
+                        blur_sigma=float(blur_sigma),
+                        blur_window=int(blur_window),
+                    )
 
                 losses = compute_flux4d_base_losses(
                     pred_rgb=pred_rgb,
@@ -770,6 +803,7 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
                 last_pred_depth = pred_depth
                 last_target_depth = target_depth
                 last_target_valid = target_valid
+                last_rgb_weight_map = rgb_weight_map
 
         optimizer.step()
 
@@ -793,6 +827,8 @@ def train_stage3_overfit(cfg: Mapping[str, object], args: Stage3OverfitArgs) -> 
                 _save_depth(step_dir / "pred_depth.png", last_pred_depth.detach())
             if use_depth and last_target_depth is not None and last_target_valid is not None:
                 _save_depth(step_dir / "gt_depth.png", last_target_depth.detach(), valid=last_target_valid)
+            if use_velocity_reweighting and last_rgb_weight_map is not None:
+                _save_depth(step_dir / "rgb_weight.png", last_rgb_weight_map.detach())
 
         save_ckpt_every = int(args.save_ckpt_every)
         if step == int(args.iters) or (save_ckpt_every > 0 and step % save_ckpt_every == 0):
