@@ -648,8 +648,13 @@ def project_points_to_camera(
     z = points_camera[:, 2]
     valid_depth = z > 0
 
-    u = x / z * fx + cx
-    v = y / z * fy + cy
+    # 仅对 valid_depth 的点执行除法，避免 z<=0 或 z==0 触发 divide-by-zero 警告并产生 inf/nan。
+    u = np.full((points_camera.shape[0],), np.nan, dtype=np.float32)
+    v = np.full((points_camera.shape[0],), np.nan, dtype=np.float32)
+    if np.any(valid_depth):
+        z_valid = z[valid_depth]
+        u[valid_depth] = (x[valid_depth] / z_valid) * fx + cx
+        v[valid_depth] = (y[valid_depth] / z_valid) * fy + cy
     mask = valid_depth & (u >= 0) & (u < float(width)) & (v >= 0) & (v < float(height))
 
     uv = np.stack([u, v], axis=1)
@@ -678,12 +683,15 @@ def sample_colors_from_image(image: np.ndarray, uv: np.ndarray, mask: np.ndarray
         raise ValueError("mask 长度必须与 uv 一致")
 
     height, width = image.shape[:2]
-    u = np.clip(np.round(uv[:, 0]).astype(np.int64), 0, width - 1)
-    v = np.clip(np.round(uv[:, 1]).astype(np.int64), 0, height - 1)
     colors = np.zeros((uv.shape[0], 3), dtype=np.float32)
     valid_idx = np.where(mask)[0]
     if valid_idx.size > 0:
-        colors[valid_idx] = image[v[valid_idx], u[valid_idx]]
+        # 仅对有效点做 round/cast/clip，避免 uv 中的 inf/nan 触发 invalid-cast 警告。
+        u = np.round(uv[valid_idx, 0]).astype(np.int64)
+        v = np.round(uv[valid_idx, 1]).astype(np.int64)
+        u = np.clip(u, 0, width - 1)
+        v = np.clip(v, 0, height - 1)
+        colors[valid_idx] = image[v, u]
     return colors
 
 

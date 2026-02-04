@@ -133,6 +133,35 @@ python tools/vis/vis_flow.py \
   --mode both --render-frames 0-15 --frame-ref 0
 ```
 
+### Stage 6: Full training + evaluation (PandaSet)
+
+Run multi-clip / multi-scene training (paper-aligned slicing preset is built into the index):
+
+```bash
+python scripts/train_stage6.py \
+  --config configs/flux4d.py \
+  --index-path data/metadata/pandaset_full_clips.pkl \
+  --data-root /home/yr/yr/data/automonous/pandaset \
+  --device cuda:0 \
+  --iters 30000 \
+  --output-dir assets/vis/stage6_train/run_001
+```
+
+Evaluate NVS (PSNR/SSIM/Depth RMSE; full + dynamic) + Scene Flow metrics:
+
+```bash
+python scripts/eval_stage6.py \
+  --config configs/flux4d.py \
+  --index-path data/metadata/pandaset_full_clips.pkl \
+  --data-root /home/yr/yr/data/automonous/pandaset \
+  --ckpt assets/vis/stage6_train/run_001/ckpt_last.pt \
+  --out-dir assets/vis/stage6_eval/run_001 \
+  --save-renders
+```
+
+The evaluator writes `metrics.json` under `--out-dir/`. Note: PandaSet cuboids annotations are stored as
+`pandas.DataFrame` pickles, so `pandas` must be available in your Python env.
+
 ## Development notes
 
 - Keep reproducible commands in this file when new scripts are added.

@@ -26,3 +26,30 @@ stage3-overfit:
 	  --index-path data/metadata/pandaset_tiny_clips.pkl \
 	  --clip-index 0 \
 	  --camera front_camera
+
+STAGE6_RUN ?= run_001
+STAGE6_ITERS ?= 30000
+STAGE6_DEVICE ?= cuda:0
+STAGE6_OUT ?= assets/vis/stage6_train/$(STAGE6_RUN)
+STAGE6_CKPT ?= assets/vis/stage6_train/$(STAGE6_RUN)/ckpt_last.pt
+STAGE6_EVAL_OUT ?= assets/vis/stage6_eval/$(STAGE6_RUN)
+
+.PHONY: stage6-train
+stage6-train:
+	$(PYTHON) scripts/train_stage6.py \
+	  --config configs/flux4d.py \
+	  --index-path data/metadata/pandaset_full_clips.pkl \
+	  --data-root $(PANDASET_ROOT) \
+	  --device $(STAGE6_DEVICE) \
+	  --iters $(STAGE6_ITERS) \
+	  --output-dir $(STAGE6_OUT)
+
+.PHONY: stage6-eval
+stage6-eval:
+	$(PYTHON) scripts/eval_stage6.py \
+	  --config configs/flux4d.py \
+	  --index-path data/metadata/pandaset_full_clips.pkl \
+	  --data-root $(PANDASET_ROOT) \
+	  --ckpt $(STAGE6_CKPT) \
+	  --out-dir $(STAGE6_EVAL_OUT) \
+	  --save-renders
